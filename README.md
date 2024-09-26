@@ -31,6 +31,10 @@ You need to build and install the provided custom kernel for the best results. T
     sudo make install 
     sudo make INSTALL_MOD_STRIP=1 modules_install 
     # update your grub and reboot
+    # Use grub-reboot instead of anything any traditional person would do.
+    # Read instructions here https://askubuntu.com/questions/838704/grub-reboot-to-specific-kernel
+    sudo grub-reboot "your kernel number"
+    sudo reboot
 
 ExtMem uses libsyscall_intercept to redirect memory related system calls. Build and install this library from source:
 https://github.com/pmem/syscall_intercept
