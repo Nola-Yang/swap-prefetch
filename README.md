@@ -26,6 +26,7 @@ You need to build and install the provided custom kernel for the best results. T
     make menuconfig # ensure userfaultfd and uring are enabled
     make -j $(nproc)
     sudo make headers_install INSTALL_HDR_PATH=usr/include # important, we put headers in the source file
+    sudo apt install liburing-dev
     # next steps install the actual kernel on your machine
     sudo make install 
     sudo make INSTALL_MOD_STRIP=1 modules_install 
