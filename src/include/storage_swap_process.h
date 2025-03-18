@@ -45,4 +45,22 @@ int swap_process_read_page(int fd, uint64_t offset, void* dest, size_t size);
  */
 int swap_process_write_page(int fd, uint64_t offset, void* src, size_t size);
 
+/**
+ * Create a checkpoint of the current swap file state.
+ * 
+ * This function creates a checkpoint by instructing the swap process
+ * to make a copy of the swap file at the current state.
+ * 
+ * @param checkpoint_name Name of the checkpoint (used in filename)
+ * @return 0 on success, -1 on failure
+ */
+int swap_process_checkpoint(const char* checkpoint_name);
+
+/**
+ * Get the time taken for the last checkpoint operation in seconds.
+ * 
+ * @return Time in seconds, or -1 if no checkpoint has been created
+ */
+double swap_process_get_last_checkpoint_time(void);
+
 #endif /* STORAGE_SWAP_PROCESS_H */

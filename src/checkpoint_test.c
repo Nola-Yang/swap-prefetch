@@ -13,124 +13,10 @@
 #include <libgen.h>
 #include "swap_shm.h"
 
-// Configuration
-#define DEFAULT_SWAP_FILE_PATH "/tmp/extmem_swap.bin"
-#define SWAP_FILE_SIZE (4UL * 1024UL * 1024UL * 1024UL)  // 4GB swap file
-
-// Global variables
-static int swap_fd = -1;
-static volatile sig_atomic_t running = 1;
-static char swap_file_path[1024] = {0};
-
-// Signal handler
-static void sig_handler(int signum) {
-    running = 0;
-}
-
-// Get the swap file path from environment or use default
-static void init_swap_file_path() {
-    const char* env_path = getenv("SWAPDIR");
-    
-    if (env_path != NULL) {
-        // Use the environment variable
-        strncpy(swap_file_path, env_path, sizeof(swap_file_path) - 1);
-        
-        // If the path is a device file or an existing directory, append a filename
-        struct stat st;
-        if (stat(swap_file_path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                // Append a file name if it's a directory
-                size_t len = strlen(swap_file_path);
-                if (swap_file_path[len-1] != '/') {
-                    strncat(swap_file_path, "/", sizeof(swap_file_path) - len - 1);
-                    len++;
-                }
-                strncat(swap_file_path, "extmem_swap.bin", sizeof(swap_file_path) - len - 1);
-            }
-            // If it's a device file, use as is
-        }
-    } else {
-        // Use default path
-        strncpy(swap_file_path, DEFAULT_SWAP_FILE_PATH, sizeof(swap_file_path) - 1);
-    }
-    
-    printf("Using swap file: %s\n", swap_file_path);
-}
-
-// Initialize the swap file
-static int init_swap_file() {
-    struct stat st;
-    
-    // Initialize the swap file path
-    init_swap_file_path();
-    
-    // Check if the swap file already exists
-    if (stat(swap_file_path, &st) == 0) {
-        // File exists, open it
-        swap_fd = open(swap_file_path, O_RDWR);
-        if (swap_fd == -1) {
-            perror("open swap file");
-            return -1;
-        }
-        
-        // Check size
-        if (st.st_size < SWAP_FILE_SIZE) {
-            // Extend file
-            if (ftruncate(swap_fd, SWAP_FILE_SIZE) == -1) {
-                perror("ftruncate swap file");
-                close(swap_fd);
-                swap_fd = -1;
-                return -1;
-            }
-        }
-    } else {
-        // File doesn't exist, create it
-        // First ensure the directory exists
-        char dir_path[1024] = {0};
-        char *last_slash = strrchr(swap_file_path, '/');
-        
-        if (last_slash != NULL) {
-            // Copy the directory part
-            size_t dir_len = last_slash - swap_file_path;
-            strncpy(dir_path, swap_file_path, dir_len);
-            dir_path[dir_len] = '\0';
-            
-            // Create directory if it doesn't exist
-            struct stat dir_st;
-            if (stat(dir_path, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
-                printf("Creating directory: %s\n", dir_path);
-                char cmd[1100];
-                snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir_path);
-                system(cmd);
-            }
-        }
-        
-        // Now create the file
-        swap_fd = open(swap_file_path, O_RDWR | O_CREAT, 0666);
-        if (swap_fd == -1) {
-            perror("create swap file");
-            return -1;
-        }
-        
-        // Set file size
-        if (ftruncate(swap_fd, SWAP_FILE_SIZE) == -1) {
-            perror("ftruncate swap file");
-            close(swap_fd);
-            swap_fd = -1;
-            return -1;
-        }
-    }
-    
-    return 0;
-}
-
-// Cleanup swap file
-static void cleanup_swap_file() {
-    if (swap_fd != -1) {
-        close(swap_fd);
-        swap_fd = -1;
-    }
-}
+// Global variables - defined in swap_process.c
+extern int swap_fd;
+extern char swap_file_path[1024];
+extern volatile sig_atomic_t running;
 
 // Read a page from the swap file
 static int read_swap_page(uint64_t disk_offset, void* buffer, size_t size) {
@@ -212,9 +98,10 @@ static int create_checkpoint(const char* checkpoint_name) {
     fsync(swap_fd);
     
     // Create checkpoint directory if it doesn't exist
-    char *swap_file_dir = dirname(strdup(swap_file_path));
+    char temp_path[1024];
+    strncpy(temp_path, swap_file_path, sizeof(temp_path) - 1);
+    char *swap_file_dir = dirname(temp_path);
     snprintf(checkpoint_dir, sizeof(checkpoint_dir), "%s/checkpoints", swap_file_dir);
-    free(swap_file_dir);
     
     if (stat(checkpoint_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         printf("Creating checkpoint directory: %s\n", checkpoint_dir);
@@ -288,7 +175,7 @@ static int create_checkpoint(const char* checkpoint_name) {
     return 0;
 }
 
-// Process a request
+// Process a request - implementation exported for use by swap_shm.c
 int process_request(swap_request_t* req) {
     int ret = 0;
     swap_shm_t* shm = get_swap_shm();
@@ -334,52 +221,4 @@ int process_request(swap_request_t* req) {
     }
     
     return ret;
-}
-
-// Main function
-int main(int argc, char* argv[]) {
-    int ret;
-    
-    // Set up signal handlers
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    
-    printf("Swap process starting...\n");
-    
-    // Initialize shared memory
-    ret = swap_shm_init(true);  // true = server (swap process)
-    if (ret != 0) {
-        fprintf(stderr, "Failed to initialize shared memory\n");
-        return 1;
-    }
-    
-    // Initialize swap file
-    ret = init_swap_file();
-    if (ret != 0) {
-        fprintf(stderr, "Failed to initialize swap file\n");
-        swap_shm_cleanup(true);
-        return 1;
-    }
-    
-    printf("Swap process initialized. Waiting for requests...\n");
-    
-    // Main loop
-    while (running) {
-        // Process requests
-        ret = swap_process_next_request();
-        if (ret != 0) {
-            fprintf(stderr, "Error processing request\n");
-            break;
-        }
-    }
-    
-    printf("Swap process shutting down...\n");
-    
-    // Clean up
-    cleanup_swap_file();
-    swap_shm_cleanup(true);
-    
-    printf("Swap process terminated.\n");
-    
-    return 0;
 }

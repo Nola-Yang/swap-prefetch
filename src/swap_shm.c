@@ -16,6 +16,9 @@ static sem_t* request_sem = NULL;
 static sem_t* response_sem = NULL;
 static uint64_t next_request_id = 1;
 
+// Forward declaration for the function in swap_process.c
+extern int process_request(swap_request_t* req);
+
 // Get shared memory pointer
 swap_shm_t* get_swap_shm(void) {
     return shm;
@@ -123,8 +126,10 @@ int swap_shm_init(bool is_server) {
         shm->total_requests = 0;
         shm->read_requests = 0;
         shm->write_requests = 0;
+        shm->checkpoint_requests = 0;
         shm->bytes_read = 0;
         shm->bytes_written = 0;
+        shm->last_checkpoint_time = -1.0;
     }
     
     return 0;
@@ -196,21 +201,17 @@ int swap_submit_request(swap_op_type_t op_type, uint64_t page_addr,
     
     uint64_t request_id = __sync_fetch_and_add(&next_request_id, 1);
     
-    // Lock the queue
     pthread_mutex_lock(&shm->queue_mutex);
     
-    // Check if queue is full
     if (shm->count >= MAX_QUEUE_SIZE) {
         pthread_mutex_unlock(&shm->queue_mutex);
         fprintf(stderr, "Request queue is full\n");
         return -1;
     }
     
-    // Get the next slot in the queue
     uint32_t tail = shm->tail;
     swap_request_t* req = &shm->requests[tail];
     
-    // Fill in the request
     req->request_id = request_id;
     req->op_type = op_type;
     req->page_addr = page_addr;
@@ -219,8 +220,13 @@ int swap_submit_request(swap_op_type_t op_type, uint64_t page_addr,
     req->status = STATUS_PENDING;
     req->error_code = 0;
     
-    // Copy page data if writing
-    if (op_type == OP_WRITE_PAGE && data != NULL) {
+    // Handle specific operation types
+    if (op_type == OP_CHECKPOINT && data != NULL) {
+        strncpy(req->checkpoint_name, (const char*)data, MAX_CHECKPOINT_NAME_LEN - 1);
+        req->checkpoint_name[MAX_CHECKPOINT_NAME_LEN - 1] = '\0';
+    }
+    else if (op_type == OP_WRITE_PAGE && data != NULL) {
+        // Copy page data if writing
         // Use the entire page buffer if this is the only request
         if (shm->count == 0) {
             req->buffer_offset = 0;
@@ -251,15 +257,21 @@ int swap_submit_request(swap_op_type_t op_type, uint64_t page_addr,
         shm->read_requests++;
     } else if (op_type == OP_WRITE_PAGE) {
         shm->write_requests++;
+    } else if (op_type == OP_CHECKPOINT) {
+        shm->checkpoint_requests++;
     }
     
-    // Unlock the queue
     pthread_mutex_unlock(&shm->queue_mutex);
     
     // Signal swap process that a request is available
     sem_post(request_sem);
     
     return request_id;
+}
+
+// Submit a checkpoint request
+int swap_submit_checkpoint_request(const char* checkpoint_name) {
+    return swap_submit_request(OP_CHECKPOINT, 0, 0, 0, (void*)checkpoint_name);
 }
 
 // Wait for a request to complete
@@ -353,31 +365,8 @@ int swap_process_next_request(void) {
     // Unlock the queue to allow more requests to be submitted
     pthread_mutex_unlock(&shm->queue_mutex);
     
-    // Process the request (actual file I/O happens here)
-    int error_code = 0;
-    switch (req->op_type) {
-        case OP_READ_PAGE:
-            // TODO: Implement read from swap file
-            // Read data into shm->page_buffer + req->buffer_offset
-            break;
-            
-        case OP_WRITE_PAGE:
-            // TODO: Implement write to swap file
-            // Write data from shm->page_buffer + req->buffer_offset
-            break;
-            
-        case OP_INIT:
-            // TODO: Initialize swap file
-            break;
-            
-        case OP_SHUTDOWN:
-            // TODO: Shutdown swap process
-            break;
-            
-        default:
-            error_code = EINVAL;
-            break;
-    }
+    // Process the request (actual file I/O happens here in process_request)
+    int error_code = process_request(req);
     
     // Lock the queue again
     pthread_mutex_lock(&shm->queue_mutex);

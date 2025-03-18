@@ -12,13 +12,15 @@
 #define SHM_SIZE (64 * 1024 * 1024)  // 64MB shared memory region
 #define MAX_QUEUE_SIZE 1024          // Maximum number of pending operations
 #define PAGE_BUFFER_SIZE (4 * 1024 * 1024)  // 4MB for page data transfer
+#define MAX_CHECKPOINT_NAME_LEN 256   // Maximum length for checkpoint name
 
 // Operation types
 typedef enum {
     OP_WRITE_PAGE,   // Write page to swap
     OP_READ_PAGE,    // Read page from swap
     OP_INIT,         // Initialize swap
-    OP_SHUTDOWN      // Shutdown swap process
+    OP_SHUTDOWN,     // Shutdown swap process
+    OP_CHECKPOINT    // Create a checkpoint of the swap file
 } swap_op_type_t;
 
 // Request status
@@ -39,6 +41,7 @@ typedef struct {
     swap_status_t status;      // Status of request
     int error_code;            // Error code if any
     uint64_t buffer_offset;    // Offset in the shared buffer for page data
+    char checkpoint_name[MAX_CHECKPOINT_NAME_LEN]; // Name for checkpoint (if op_type is OP_CHECKPOINT)
 } swap_request_t;
 
 // Shared memory structure
@@ -56,8 +59,10 @@ typedef struct {
     uint64_t total_requests;   // Total number of requests processed
     uint64_t read_requests;    // Number of read requests
     uint64_t write_requests;   // Number of write requests
+    uint64_t checkpoint_requests; // Number of checkpoint requests
     uint64_t bytes_read;       // Total bytes read
     uint64_t bytes_written;    // Total bytes written
+    double last_checkpoint_time; // Time taken for last checkpoint (seconds)
     
     // Page data buffer
     char page_buffer[PAGE_BUFFER_SIZE];  // Buffer for page data transfer
@@ -72,6 +77,9 @@ int swap_shm_cleanup(bool is_server);
 // Submit a request to the swap process (called by ExtMem)
 int swap_submit_request(swap_op_type_t op_type, uint64_t page_addr, 
                       uint64_t disk_offset, size_t page_size, void* data);
+
+// Submit a checkpoint request with name (called by ExtMem)
+int swap_submit_checkpoint_request(const char* checkpoint_name);
 
 // Wait for a request to complete (called by ExtMem)
 int swap_wait_request(uint64_t request_id, int* error_code);

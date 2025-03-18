@@ -11,12 +11,12 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <spawn.h>
+#include <sys/time.h>
 
 #include "core.h"
 #include "swap_shm.h"
 #include "storage_swap_process.h"
 
-// Global variables
 static pid_t swap_process_pid = -1;
 static bool swap_initialized = false;
 static pthread_mutex_t swap_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -304,4 +304,50 @@ int swap_process_write_page(int fd, uint64_t offset, void* src, size_t size) {
     
     // All retries failed
     return -1;
+}
+
+// Create a checkpoint of the current swap file state
+int swap_process_checkpoint(const char* checkpoint_name) {
+    if (!swap_initialized) {
+        fprintf(stderr, "Swap process not initialized\n");
+        return -1;
+    }
+    
+    struct timeval start_time, end_time;
+    gettimeofday(&start_time, NULL);
+    
+    // Send checkpoint request
+    uint64_t req_id = swap_submit_checkpoint_request(checkpoint_name);
+    if (req_id < 0) {
+        fprintf(stderr, "Failed to submit checkpoint request\n");
+        return -1;
+    }
+    
+    // Wait for checkpoint to complete
+    int error_code;
+    int ret = swap_wait_request(req_id, &error_code);
+    
+    gettimeofday(&end_time, NULL);
+    double elapsed = (end_time.tv_sec - start_time.tv_sec) + 
+                    (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
+    
+    printf("Checkpoint '%s' completed in %.3f seconds\n", 
+           checkpoint_name ? checkpoint_name : "unnamed", elapsed);
+    
+    if (ret != 0) {
+        fprintf(stderr, "Checkpoint failed with error code: %d\n", error_code);
+        return -1;
+    }
+    
+    return 0;
+}
+
+// Get the time taken for the last checkpoint
+double swap_process_get_last_checkpoint_time(void) {
+    swap_shm_t* shm = get_swap_shm();
+    if (shm == NULL) {
+        return -1.0;
+    }
+    
+    return shm->last_checkpoint_time;
 }

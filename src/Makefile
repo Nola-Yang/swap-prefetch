@@ -109,5 +109,11 @@ storagemanager.o: storagemanager.c storagemanager.h core.h
 fifo.o: fifo.c fifo.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c fifo.c
 
+checkpoint_test: checkpoint_test.o
+	$(CC) -o checkpoint_test checkpoint_test.o -lextmem-default -L. -lpthread -lrt
+
+checkpoint_test.o: checkpoint_test.c include/storage_swap_process.h include/swap_shm.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c checkpoint_test.c
+
 clean:
-	$(RM) *.o *.so policies/*.o swap_process
+	$(RM) *.o *.so policies/*.o swap_process checkpoint_test
