@@ -8,29 +8,66 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/time.h>
+#include <time.h>
+#include <libgen.h>
 #include "swap_shm.h"
 
 // Configuration
-#define SWAP_FILE_PATH "/tmp/extmem_swap.bin"
+#define DEFAULT_SWAP_FILE_PATH "/tmp/extmem_swap.bin"
 #define SWAP_FILE_SIZE (4UL * 1024UL * 1024UL * 1024UL)  // 4GB swap file
 
-// Global variables
-static int swap_fd = -1;
-static volatile sig_atomic_t running = 1;
+// Global variables 
+int swap_fd = -1;
+volatile sig_atomic_t running = 1;
+char swap_file_path[1024] = {0};
 
 // Signal handler
 static void sig_handler(int signum) {
     running = 0;
 }
 
+// Get the swap file path from environment or use default
+static void init_swap_file_path() {
+    const char* env_path = getenv("SWAPDIR");
+    
+    if (env_path != NULL) {
+        // Use the environment variable
+        strncpy(swap_file_path, env_path, sizeof(swap_file_path) - 1);
+        
+        // If the path is a device file or an existing directory, append a filename
+        struct stat st;
+        if (stat(swap_file_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                // Append a file name if it's a directory
+                size_t len = strlen(swap_file_path);
+                if (swap_file_path[len-1] != '/') {
+                    strncat(swap_file_path, "/", sizeof(swap_file_path) - len - 1);
+                    len++;
+                }
+                strncat(swap_file_path, "extmem_swap.bin", sizeof(swap_file_path) - len - 1);
+            }
+            // If it's a device file, use as is
+        }
+    } else {
+        // Use default path
+        strncpy(swap_file_path, DEFAULT_SWAP_FILE_PATH, sizeof(swap_file_path) - 1);
+    }
+    
+    printf("Using swap file: %s\n", swap_file_path);
+}
+
 // Initialize the swap file
 static int init_swap_file() {
     struct stat st;
     
+    // Initialize the swap file path
+    init_swap_file_path();
+    
     // Check if the swap file already exists
-    if (stat(SWAP_FILE_PATH, &st) == 0) {
+    if (stat(swap_file_path, &st) == 0) {
         // File exists, open it
-        swap_fd = open(SWAP_FILE_PATH, O_RDWR | O_DIRECT);
+        swap_fd = open(swap_file_path, O_RDWR);
         if (swap_fd == -1) {
             perror("open swap file");
             return -1;
@@ -48,7 +85,28 @@ static int init_swap_file() {
         }
     } else {
         // File doesn't exist, create it
-        swap_fd = open(SWAP_FILE_PATH, O_RDWR | O_CREAT | O_DIRECT, 0666);
+        // First ensure the directory exists
+        char dir_path[1024] = {0};
+        char *last_slash = strrchr(swap_file_path, '/');
+        
+        if (last_slash != NULL) {
+            // Copy the directory part
+            size_t dir_len = last_slash - swap_file_path;
+            strncpy(dir_path, swap_file_path, dir_len);
+            dir_path[dir_len] = '\0';
+            
+            // Create directory if it doesn't exist
+            struct stat dir_st;
+            if (stat(dir_path, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
+                printf("Creating directory: %s\n", dir_path);
+                char cmd[1100];
+                snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir_path);
+                system(cmd);
+            }
+        }
+        
+        // Now create the file
+        swap_fd = open(swap_file_path, O_RDWR | O_CREAT, 0666);
         if (swap_fd == -1) {
             perror("create swap file");
             return -1;
@@ -61,9 +119,6 @@ static int init_swap_file() {
             swap_fd = -1;
             return -1;
         }
-        
-        // Optionally, you could pre-initialize the file here
-        // For example, fill it with zeros
     }
     
     return 0;
@@ -136,8 +191,106 @@ static int write_swap_page(uint64_t disk_offset, const void* buffer, size_t size
     return 0;
 }
 
-// Process a request
-static int process_request(swap_request_t* req) {
+// Create a checkpoint of the swap file
+static int create_checkpoint(const char* checkpoint_name) {
+    struct timeval start, end;
+    double elapsed_time;
+    char checkpoint_path[1024];
+    char checkpoint_dir[1024];
+    struct stat st;
+    int ret;
+    
+    // Start timing
+    gettimeofday(&start, NULL);
+    
+    if (swap_fd == -1) {
+        fprintf(stderr, "Swap file not initialized\n");
+        return -1;
+    }
+    
+    // Make sure all data is written to disk
+    fsync(swap_fd);
+    
+    // Create checkpoint directory if it doesn't exist
+    char temp_path[1024];
+    strncpy(temp_path, swap_file_path, sizeof(temp_path) - 1);
+    char *swap_file_dir = dirname(temp_path);
+    snprintf(checkpoint_dir, sizeof(checkpoint_dir), "%s/checkpoints", swap_file_dir);
+    
+    if (stat(checkpoint_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("Creating checkpoint directory: %s\n", checkpoint_dir);
+        char cmd[1100];
+        snprintf(cmd, sizeof(cmd), "mkdir -p %s", checkpoint_dir);
+        system(cmd);
+    }
+    
+    // Generate checkpoint filename
+    if (checkpoint_name && checkpoint_name[0]) {
+        snprintf(checkpoint_path, sizeof(checkpoint_path), 
+                 "%s/%s.bin", checkpoint_dir, checkpoint_name);
+    } else {
+        // Generate timestamp-based name if no name provided
+        time_t t = time(NULL);
+        struct tm* tm_info = localtime(&t);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+        
+        snprintf(checkpoint_path, sizeof(checkpoint_path), 
+                 "%s/checkpoint_%s.bin", checkpoint_dir, timestamp);
+    }
+    
+    // Create a copy of the swap file
+    FILE *source = fdopen(dup(swap_fd), "rb");
+    if (!source) {
+        perror("fdopen source");
+        return -1;
+    }
+    
+    FILE *dest = fopen(checkpoint_path, "wb");
+    if (!dest) {
+        perror("fopen destination");
+        fclose(source);
+        return -1;
+    }
+    
+    // Copy file contents using a buffer
+    char buffer[64 * 1024]; // 64KB buffer
+    size_t bytes;
+    
+    // Reset to beginning of file
+    rewind(source);
+    
+    while ((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
+        if (fwrite(buffer, 1, bytes, dest) != bytes) {
+            perror("fwrite");
+            fclose(source);
+            fclose(dest);
+            return -1;
+        }
+    }
+    
+    // Clean up
+    fclose(source);
+    fclose(dest);
+    
+    // End timing
+    gettimeofday(&end, NULL);
+    elapsed_time = (end.tv_sec - start.tv_sec) + 
+                   (end.tv_usec - start.tv_usec) / 1000000.0;
+    
+    printf("Checkpoint created at %s in %.2f seconds\n", checkpoint_path, elapsed_time);
+    
+    // Store checkpoint time in shared memory
+    swap_shm_t* shm = get_swap_shm();
+    if (shm != NULL) {
+        shm->last_checkpoint_time = elapsed_time;
+    }
+    
+    return 0;
+}
+
+// 关键函数：处理swap请求（此函数由swap_shm.c调用）
+int process_request(swap_request_t* req) {
     int ret = 0;
     swap_shm_t* shm = get_swap_shm();
     
@@ -162,6 +315,11 @@ static int process_request(swap_request_t* req) {
             }
             break;
             
+        case OP_CHECKPOINT:
+            // Create a checkpoint of the swap file
+            ret = create_checkpoint(req->checkpoint_name);
+            break;
+            
         case OP_INIT:
             // Nothing to do, already initialized
             break;
@@ -179,7 +337,8 @@ static int process_request(swap_request_t* req) {
     return ret;
 }
 
-// Main function
+#ifdef BUILD_EXECUTABLE
+// Main function - 仅当构建可执行文件时包含
 int main(int argc, char* argv[]) {
     int ret;
     
@@ -226,3 +385,4 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
+#endif

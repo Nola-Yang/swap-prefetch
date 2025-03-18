@@ -58,26 +58,36 @@ LIBS = -lm -lpthread -luring -ldl -lsyscall_intercept -lrt
 
 default: libextmem-default.so swap_process
 
-all: libextmem-default.so libextmem-pagerank.so swap_process
+all: libextmem-default.so libextmem-pagerank.so swap_process checkpoint_test
 
+libextmem-default.so: extmem-default.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o swap_common.o
+	$(CC) $(LDFLAGS) -o libextmem-default.so extmem-default.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o swap_common.o $(LIBS)
 
-libextmem-default.so: extmem-default.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o
-	$(CC) $(LDFLAGS) -o libextmem-default.so extmem-default.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o $(LIBS)
+libextmem-pagerank.so: extmem-pagerank.o policies/pagerank.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o swap_common.o
+	$(CC) $(LDFLAGS) -o libextmem-pagerank.so extmem-pagerank.o policies/pagerank.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o swap_common.o $(LIBS)
 
-libextmem-pagerank.so: extmem-pagerank.o policies/pagerank.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o
-	$(CC) $(LDFLAGS) -o libextmem-pagerank.so extmem-pagerank.o policies/pagerank.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o $(LIBS)
+swap_common.o: swap_process.c include/swap_shm.h
+	$(CC) $(CFLAGS) $(INCLUDES) -DBUILD_COMMON -c swap_process.c -o swap_common.o
+
+swap_process.o: swap_process.c include/swap_shm.h
+	$(CC) $(CFLAGS) $(INCLUDES) -DBUILD_EXECUTABLE -c swap_process.c -o swap_process.o
 
 swap_process: swap_process.o swap_shm.o
 	$(CC) -o swap_process swap_process.o swap_shm.o -lpthread -lrt
+
+# Checkpoint
+checkpoint_test: checkpoint_test.o
+	$(CC) -o checkpoint_test checkpoint_test.o -L. -lextmem-default -lpthread -lrt
+
+checkpoint_test.o: checkpoint_test.c include/storage_swap_process.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c checkpoint_test.c
+
 
 extmem-default.o: core.c core.h policies/disklinux.h intercept_layer.h observability.h fifo.h storagemanager.h include/swap_shm.h include/storage_swap_process.h
 	$(CC) $(CFLAGS) $(INCLUDES) -D ALLOC_DISK -D LRU_SWAP -D USWAP_SWAP_PROCESS -c core.c -o extmem-default.o
 
 extmem-pagerank.o: core.c core.h policies/pageRank.h intercept_layer.h observability.h fifo.h storagemanager.h include/swap_shm.h include/storage_swap_process.h
 	$(CC) $(CFLAGS) $(INCLUDES) -D ALLOC_DISK -D PAGE_RANK -D LRU_SWAP -D USWAP_SWAP_PROCESS -c core.c -o extmem-pagerank.o
-
-swap_process.o: swap_process.c include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c swap_process.c
 
 swap_shm.o: swap_shm.c include/swap_shm.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c swap_shm.c
@@ -108,12 +118,6 @@ storagemanager.o: storagemanager.c storagemanager.h core.h
 
 fifo.o: fifo.c fifo.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c fifo.c
-
-checkpoint_test: checkpoint_test.o
-	$(CC) -o checkpoint_test checkpoint_test.o -lextmem-default -L. -lpthread -lrt
-
-checkpoint_test.o: checkpoint_test.c include/storage_swap_process.h include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c checkpoint_test.c
 
 clean:
 	$(RM) *.o *.so policies/*.o swap_process checkpoint_test

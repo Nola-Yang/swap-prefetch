@@ -2,223 +2,267 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
 #include <sys/time.h>
 #include <time.h>
-#include <libgen.h>
-#include "swap_shm.h"
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 
-// Global variables - defined in swap_process.c
-extern int swap_fd;
-extern char swap_file_path[1024];
-extern volatile sig_atomic_t running;
+// 使用ExtMem提供的API
+#include "storage_swap_process.h"
 
-// Read a page from the swap file
-static int read_swap_page(uint64_t disk_offset, void* buffer, size_t size) {
-    if (swap_fd == -1) {
-        fprintf(stderr, "Swap file not initialized\n");
-        return -1;
-    }
-    
-    // Seek to the offset
-    if (lseek(swap_fd, disk_offset, SEEK_SET) == -1) {
-        perror("lseek");
-        return -1;
-    }
-    
-    // Read the page
-    ssize_t bytes_read = read(swap_fd, buffer, size);
-    if (bytes_read == -1) {
-        perror("read");
-        return -1;
-    }
-    
-    if ((size_t)bytes_read != size) {
-        fprintf(stderr, "Partial read: %zd of %zu bytes\n", bytes_read, size);
-        return -1;
-    }
-    
-    return 0;
+// 测试中使用的常量
+#define TEST_PAGE_SIZE 4096
+#define MB (1024 * 1024)
+#define GB (1024 * MB)
+
+// 获取当前时间（秒）
+double get_time() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
-// Write a page to the swap file
-static int write_swap_page(uint64_t disk_offset, const void* buffer, size_t size) {
-    if (swap_fd == -1) {
-        fprintf(stderr, "Swap file not initialized\n");
-        return -1;
+// 将字节数格式化为人类可读的字符串
+void format_size(char *buf, size_t buf_size, uint64_t bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    int unit = 0;
+    double size = bytes;
+    
+    while (size >= 1024 && unit < 4) {
+        size /= 1024;
+        unit++;
     }
     
-    // Seek to the offset
-    if (lseek(swap_fd, disk_offset, SEEK_SET) == -1) {
-        perror("lseek");
-        return -1;
-    }
-    
-    // Write the page
-    ssize_t bytes_written = write(swap_fd, buffer, size);
-    if (bytes_written == -1) {
-        perror("write");
-        return -1;
-    }
-    
-    if ((size_t)bytes_written != size) {
-        fprintf(stderr, "Partial write: %zd of %zu bytes\n", bytes_written, size);
-        return -1;
-    }
-    
-    // Ensure data is written to disk
-    fsync(swap_fd);
-    
-    return 0;
+    snprintf(buf, buf_size, "%.2f %s", size, units[unit]);
 }
 
-// Create a checkpoint of the swap file
-static int create_checkpoint(const char* checkpoint_name) {
-    struct timeval start, end;
-    double elapsed_time;
-    char checkpoint_path[1024];
-    char checkpoint_dir[1024];
-    struct stat st;
-    int ret;
+// 用指定模式填充内存并返回触及的页面数
+int fill_memory(void *memory, size_t size, int pattern) {
+    unsigned char *ptr = (unsigned char *)memory;
+    int pages_touched = 0;
     
-    // Start timing
-    gettimeofday(&start, NULL);
-    
-    if (swap_fd == -1) {
-        fprintf(stderr, "Swap file not initialized\n");
-        return -1;
-    }
-    
-    // Make sure all data is written to disk
-    fsync(swap_fd);
-    
-    // Create checkpoint directory if it doesn't exist
-    char temp_path[1024];
-    strncpy(temp_path, swap_file_path, sizeof(temp_path) - 1);
-    char *swap_file_dir = dirname(temp_path);
-    snprintf(checkpoint_dir, sizeof(checkpoint_dir), "%s/checkpoints", swap_file_dir);
-    
-    if (stat(checkpoint_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        printf("Creating checkpoint directory: %s\n", checkpoint_dir);
-        char cmd[1100];
-        snprintf(cmd, sizeof(cmd), "mkdir -p %s", checkpoint_dir);
-        system(cmd);
-    }
-    
-    // Generate checkpoint filename
-    if (checkpoint_name && checkpoint_name[0]) {
-        snprintf(checkpoint_path, sizeof(checkpoint_path), 
-                 "%s/%s.bin", checkpoint_dir, checkpoint_name);
-    } else {
-        // Generate timestamp-based name if no name provided
-        time_t t = time(NULL);
-        struct tm* tm_info = localtime(&t);
-        char timestamp[64];
-        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+    for (size_t i = 0; i < size; i += TEST_PAGE_SIZE) {
+        // 在每页开始处写入
+        ptr[i] = (unsigned char)(pattern & 0xFF);
+        pages_touched++;
         
-        snprintf(checkpoint_path, sizeof(checkpoint_path), 
-                 "%s/checkpoint_%s.bin", checkpoint_dir, timestamp);
-    }
-    
-    // Create a copy of the swap file
-    FILE *source = fdopen(dup(swap_fd), "rb");
-    if (!source) {
-        perror("fdopen source");
-        return -1;
-    }
-    
-    FILE *dest = fopen(checkpoint_path, "wb");
-    if (!dest) {
-        perror("fopen destination");
-        fclose(source);
-        return -1;
-    }
-    
-    // Copy file contents using a buffer
-    char buffer[64 * 1024]; // 64KB buffer
-    size_t bytes;
-    
-    // Reset to beginning of file
-    rewind(source);
-    
-    while ((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
-        if (fwrite(buffer, 1, bytes, dest) != bytes) {
-            perror("fwrite");
-            fclose(source);
-            fclose(dest);
-            return -1;
+        // 每10%进度打印一次
+        if (i % (size / 10) == 0) {
+            printf("\rProgress: %.0f%%", (float)i * 100 / size);
+            fflush(stdout);
         }
     }
+    printf("\rProgress: 100%%\n");
     
-    // Clean up
-    fclose(source);
-    fclose(dest);
+    return pages_touched;
+}
+
+// 验证内存中的模式并返回错误数
+int verify_memory(void *memory, size_t size, int pattern) {
+    unsigned char *ptr = (unsigned char *)memory;
+    int errors = 0;
     
-    // End timing
-    gettimeofday(&end, NULL);
-    elapsed_time = (end.tv_sec - start.tv_sec) + 
-                   (end.tv_usec - start.tv_usec) / 1000000.0;
+    for (size_t i = 0; i < size; i += TEST_PAGE_SIZE) {
+        if (ptr[i] != (unsigned char)(pattern & 0xFF)) {
+            errors++;
+        }
+        
+        // 每10%进度打印一次
+        if (i % (size / 10) == 0) {
+            printf("\rVerifying: %.0f%%", (float)i * 100 / size);
+            fflush(stdout);
+        }
+    }
+    printf("\rVerifying: 100%%\n");
     
-    printf("Checkpoint created at %s in %.2f seconds\n", checkpoint_path, elapsed_time);
+    return errors;
+}
+
+// 模拟随机访问内存
+void random_access(void *memory, size_t size, int num_accesses) {
+    unsigned char *ptr = (unsigned char *)memory;
+    int pages = size / TEST_PAGE_SIZE;
     
-    // Store checkpoint time in shared memory
-    swap_shm_t* shm = get_swap_shm();
-    if (shm != NULL) {
-        shm->last_checkpoint_time = elapsed_time;
+    printf("Performing %d random memory accesses...\n", num_accesses);
+    
+    for (int i = 0; i < num_accesses; i++) {
+        size_t page = rand() % pages;
+        size_t offset = page * TEST_PAGE_SIZE;
+        
+        // 读取
+        unsigned char value = ptr[offset];
+        
+        // 写入（增加值）
+        ptr[offset] = value + 1;
+        
+        // 每10%进度打印一次
+        if (i % (num_accesses / 10) == 0) {
+            printf("\rProgress: %.0f%%", (float)i * 100 / num_accesses);
+            fflush(stdout);
+        }
+    }
+    printf("\rProgress: 100%%\n");
+}
+
+// 获取交换文件大小
+uint64_t get_swap_file_size() {
+    const char* swap_dir = getenv("SWAPDIR");
+    char swap_file_path[1024];
+    
+    if (swap_dir) {
+        struct stat st;
+        if (stat(swap_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(swap_file_path, sizeof(swap_file_path), "%s/extmem_swap.bin", swap_dir);
+        } else {
+            strcpy(swap_file_path, swap_dir);
+        }
+    } else {
+        strcpy(swap_file_path, "/tmp/extmem_swap.bin");
+    }
+    
+    struct stat st;
+    if (stat(swap_file_path, &st) == 0) {
+        return st.st_size;
     }
     
     return 0;
 }
 
-// Process a request - implementation exported for use by swap_shm.c
-int process_request(swap_request_t* req) {
-    int ret = 0;
-    swap_shm_t* shm = get_swap_shm();
+int main(int argc, char* argv[]) {
+    // 解析参数
+    size_t memory_size = 512 * MB;  // 默认: 512MB
+    int checkpoint_interval = 5;    // 默认: 5秒
+    int run_time = 60;              // 默认: 60秒
     
-    switch (req->op_type) {
-        case OP_READ_PAGE:
-            // Read page from swap file
-            ret = read_swap_page(req->disk_offset, 
-                               shm->page_buffer + req->buffer_offset, 
-                               req->page_size);
-            if (ret == 0) {
-                shm->bytes_read += req->page_size;
-            }
-            break;
-            
-        case OP_WRITE_PAGE:
-            // Write page to swap file
-            ret = write_swap_page(req->disk_offset, 
-                                shm->page_buffer + req->buffer_offset, 
-                                req->page_size);
-            if (ret == 0) {
-                shm->bytes_written += req->page_size;
-            }
-            break;
-            
-        case OP_CHECKPOINT:
-            // Create a checkpoint of the swap file
-            ret = create_checkpoint(req->checkpoint_name);
-            break;
-            
-        case OP_INIT:
-            // Nothing to do, already initialized
-            break;
-            
-        case OP_SHUTDOWN:
-            running = 0;
-            break;
-            
-        default:
-            fprintf(stderr, "Unknown operation type: %d\n", req->op_type);
-            ret = -1;
-            break;
+    if (argc > 1) memory_size = (size_t)atol(argv[1]) * MB;
+    if (argc > 2) checkpoint_interval = atoi(argv[2]);
+    if (argc > 3) run_time = atoi(argv[3]);
+    
+    // 初始化
+    char size_str[32];
+    format_size(size_str, sizeof(size_str), memory_size);
+    printf("=== ExtMem Checkpoint Test ===\n");
+    printf("Memory Size:          %s\n", size_str);
+    printf("Checkpoint Interval:  %d seconds\n", checkpoint_interval);
+    printf("Total Run Time:       %d seconds\n", run_time);
+    printf("\n");
+    
+    // 初始化存储系统
+    printf("Initializing storage...\n");
+    if (storage_init() != 0) {
+        fprintf(stderr, "Failed to initialize storage\n");
+        return 1;
     }
     
-    return ret;
+    // 使用mmap分配内存
+    printf("Allocating %s of memory...\n", size_str);
+    double start_time = get_time();
+    
+    void *memory = mmap(NULL, memory_size, PROT_READ | PROT_WRITE, 
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+        perror("mmap failed");
+        storage_shutdown();
+        return 1;
+    }
+    
+    double alloc_time = get_time() - start_time;
+    printf("Memory allocation completed in %.2f seconds\n", alloc_time);
+    
+    // 用模式填充内存
+    printf("Writing to memory...\n");
+    start_time = get_time();
+    int pages_touched = fill_memory(memory, memory_size, 0xAA);
+    double write_time = get_time() - start_time;
+    printf("Memory write completed in %.2f seconds (%.2f MB/s)\n", 
+           write_time, (memory_size / MB) / write_time);
+    
+    // 主测试循环
+    printf("\nStarting checkpoint test loop...\n");
+    double test_start_time = get_time();
+    double next_checkpoint_time = test_start_time + checkpoint_interval;
+    int checkpoint_count = 0;
+    double total_checkpoint_time = 0.0;
+    double max_checkpoint_time = 0.0;
+    double min_checkpoint_time = 999999.0;
+    
+    while (get_time() - test_start_time < run_time) {
+        double current_time = get_time();
+        
+        // 是否到创建检查点的时间？
+        if (current_time >= next_checkpoint_time) {
+            char checkpoint_name[64];
+            sprintf(checkpoint_name, "cp_%d", checkpoint_count);
+            
+            printf("\nCreating checkpoint: %s\n", checkpoint_name);
+            start_time = get_time();
+            
+            if (swap_process_checkpoint(checkpoint_name) != 0) {
+                fprintf(stderr, "Checkpoint failed\n");
+            } else {
+                double cp_time = get_time() - start_time;
+                double cp_rate = (memory_size / MB) / cp_time;
+                
+                total_checkpoint_time += cp_time;
+                if (cp_time > max_checkpoint_time) max_checkpoint_time = cp_time;
+                if (cp_time < min_checkpoint_time) min_checkpoint_time = cp_time;
+                
+                checkpoint_count++;
+                printf("Checkpoint completed in %.2f seconds (%.2f MB/s)\n", 
+                       cp_time, cp_rate);
+                
+                // 测量交换文件大小
+                uint64_t swap_size = get_swap_file_size();
+                char swap_size_str[32];
+                format_size(swap_size_str, sizeof(swap_size_str), swap_size);
+                printf("Current swap file size: %s\n", swap_size_str);
+            }
+            
+            next_checkpoint_time = current_time + checkpoint_interval;
+        }
+        
+        // 执行一些随机内存访问
+        int accesses = memory_size / TEST_PAGE_SIZE / 100;  // 触及约1%的页面
+        if (accesses < 10) accesses = 10;
+        if (accesses > 1000) accesses = 1000;
+        
+        start_time = get_time();
+        random_access(memory, memory_size, accesses);
+        double access_time = get_time() - start_time;
+        printf("Random access of %d pages completed in %.2f seconds (%.2f pages/sec)\n", 
+               accesses, access_time, accesses / access_time);
+        
+        // 短暂睡眠以避免占用过多CPU
+        usleep(100000);  // 100ms
+    }
+    
+    // 最终统计
+    printf("\n=== Checkpoint Test Results ===\n");
+    printf("Total checkpoints created:  %d\n", checkpoint_count);
+    if (checkpoint_count > 0) {
+        printf("Average checkpoint time:    %.2f seconds\n", total_checkpoint_time / checkpoint_count);
+        printf("Minimum checkpoint time:    %.2f seconds\n", min_checkpoint_time);
+        printf("Maximum checkpoint time:    %.2f seconds\n", max_checkpoint_time);
+        
+        // 测量交换文件大小
+        uint64_t swap_size = get_swap_file_size();
+        char swap_size_str[32];
+        format_size(swap_size_str, sizeof(swap_size_str), swap_size);
+        printf("Final swap file size:       %s\n", swap_size_str);
+    }
+    
+    // 清理
+    printf("\nCleaning up...\n");
+    if (munmap(memory, memory_size) == -1) {
+        perror("munmap failed");
+        storage_shutdown();
+        return 1;
+    }
+    
+    storage_shutdown();
+    printf("Test completed successfully!\n");
+    
+    return 0;
 }

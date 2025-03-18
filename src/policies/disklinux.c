@@ -1290,3 +1290,18 @@ void uswap_stats()
    
 }
 
+
+void lrudisk_stats() {
+  LOG("=== LRU Disk Policy Statistics ===\n");
+  LOG("active_list size: %lu\n", active_list.numentries);
+  LOG("inactive_list size: %lu\n", inactive_list.numentries);
+  LOG("free_list size: %lu\n", free_list.numentries);
+  LOG("swap_list size: %lu\n", swap_list.numentries);
+  LOG("dram_allocated: %lu\n", dram_allocated);
+  LOG("disk_allocated: %lu\n", disk_allocated);
+  LOG("dram_limit: %lu\n", dram_limit);
+  LOG("statistics: refault: %lu, disk_eviction: %lu, disk_promotion: %lu\n", 
+      refault, disk_eviction, disk_promotion);
+  LOG("statistics: reactive_prefault: %lu, reactive_swap: %lu, wp_faults: %lu, prefetch_hit: %lu\n", 
+      reactive_prefault, reactive_swap, wp_faults, prefetch_hit);
+}

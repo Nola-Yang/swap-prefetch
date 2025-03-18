@@ -17,10 +17,9 @@
 #define DEFAULT_SWAP_FILE_PATH "/tmp/extmem_swap.bin"
 #define SWAP_FILE_SIZE (4UL * 1024UL * 1024UL * 1024UL)  // 4GB swap file
 
-// Global variables
-static int swap_fd = -1;
-static volatile sig_atomic_t running = 1;
-static char swap_file_path[1024] = {0};
+int swap_fd = -1;
+volatile sig_atomic_t running = 1;
+char swap_file_path[1024] = {0};
 
 // Signal handler
 static void sig_handler(int signum) {
@@ -212,9 +211,10 @@ static int create_checkpoint(const char* checkpoint_name) {
     fsync(swap_fd);
     
     // Create checkpoint directory if it doesn't exist
-    char *swap_file_dir = dirname(strdup(swap_file_path));
+    char temp_path[1024];
+    strncpy(temp_path, swap_file_path, sizeof(temp_path) - 1);
+    char *swap_file_dir = dirname(temp_path);
     snprintf(checkpoint_dir, sizeof(checkpoint_dir), "%s/checkpoints", swap_file_dir);
-    free(swap_file_dir);
     
     if (stat(checkpoint_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         printf("Creating checkpoint directory: %s\n", checkpoint_dir);
@@ -288,7 +288,6 @@ static int create_checkpoint(const char* checkpoint_name) {
     return 0;
 }
 
-// Process a request
 int process_request(swap_request_t* req) {
     int ret = 0;
     swap_shm_t* shm = get_swap_shm();
@@ -336,7 +335,8 @@ int process_request(swap_request_t* req) {
     return ret;
 }
 
-// Main function
+#ifdef BUILD_EXECUTABLE
+// Main function 
 int main(int argc, char* argv[]) {
     int ret;
     
@@ -383,3 +383,4 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
+#endif
