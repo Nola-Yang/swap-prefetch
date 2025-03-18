@@ -268,6 +268,22 @@ void extmem_init()
 
 
 
+// #ifdef SWAPPER
+//   // SSD Init
+//   // for now only requirement from disk is to have a file descriptor
+//   diskpath = getenv("SWAPDIR");
+//   if(diskpath == NULL) {
+//     diskpath = malloc(sizeof(SWAPPATH_DEFAULT));
+//     strcpy(diskpath, SWAPPATH_DEFAULT);
+//   }  
+
+//   diskfd = open(diskpath, O_RDWR | O_DIRECT);
+//   if (diskfd < 0) {
+//     perror("disk open");
+//   }
+//   assert(diskfd >= 0);
+// #endif
+  
 #ifdef SWAPPER
   // SSD Init
   // for now only requirement from disk is to have a file descriptor
@@ -282,6 +298,12 @@ void extmem_init()
     perror("disk open");
   }
   assert(diskfd >= 0);
+  
+  // 初始化swap进程
+  if (storage_init() != 0) {
+    perror("storage_init");
+    assert(0);
+  }
 #endif
   
 
@@ -396,11 +418,12 @@ void extmem_init()
 
 void extmem_stop()
 {
-
   policy_shutdown();
-
+  
+#ifdef SWAPPER
+  storage_shutdown();
+#endif
 }
-
 
 static void extmem_mmap_populate(void* addr, size_t length)
 {
@@ -580,14 +603,20 @@ int extmem_munmap(void* addr, size_t length)
 // TODO: turn this from hardcoded fd to a object oriented storage manager
 void extmem_disk_write(int storage_fd, void* src, uint64_t dest, size_t pagesize)
 {
+#ifdef USWAP_SWAP_PROCESS
     write_page(storage_fd, dest, src, pagesize);
-  
+#else
+    write_page(storage_fd, dest, src, pagesize);
+#endif
 }
 
 void extmem_disk_read(int storage_fd, uint64_t src, void *dest, size_t pagesize)
 {
-    read_page(storage_fd, (uint64_t)src, dest, pagesize);
-  
+#ifdef USWAP_SWAP_PROCESS
+    read_page(storage_fd, src, dest, pagesize);
+#else
+    read_page(storage_fd, src, dest, pagesize);
+#endif
 }
 
 
