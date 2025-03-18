@@ -11,60 +11,26 @@
 #include "swap_shm.h"
 
 // Configuration
-#define DEFAULT_SWAP_FILE_PATH "/tmp/extmem_swap.bin"
+#define SWAP_FILE_PATH "/tmp/extmem_swap.bin"
 #define SWAP_FILE_SIZE (4UL * 1024UL * 1024UL * 1024UL)  // 4GB swap file
 
 // Global variables
 static int swap_fd = -1;
 static volatile sig_atomic_t running = 1;
-static char swap_file_path[1024] = {0};
 
 // Signal handler
 static void sig_handler(int signum) {
     running = 0;
 }
 
-// Get the swap file path from environment or use default
-static void init_swap_file_path() {
-    const char* env_path = getenv("SWAPDIR");
-    
-    if (env_path != NULL) {
-        // Use the environment variable
-        strncpy(swap_file_path, env_path, sizeof(swap_file_path) - 1);
-        
-        // If the path is a device file or an existing directory, append a filename
-        struct stat st;
-        if (stat(swap_file_path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                // Append a file name if it's a directory
-                size_t len = strlen(swap_file_path);
-                if (swap_file_path[len-1] != '/') {
-                    strncat(swap_file_path, "/", sizeof(swap_file_path) - len - 1);
-                    len++;
-                }
-                strncat(swap_file_path, "extmem_swap.bin", sizeof(swap_file_path) - len - 1);
-            }
-            // If it's a device file, use as is
-        }
-    } else {
-        // Use default path
-        strncpy(swap_file_path, DEFAULT_SWAP_FILE_PATH, sizeof(swap_file_path) - 1);
-    }
-    
-    printf("Using swap file: %s\n", swap_file_path);
-}
-
 // Initialize the swap file
 static int init_swap_file() {
     struct stat st;
     
-    // Initialize the swap file path
-    init_swap_file_path();
-    
     // Check if the swap file already exists
-    if (stat(swap_file_path, &st) == 0) {
+    if (stat(SWAP_FILE_PATH, &st) == 0) {
         // File exists, open it
-        swap_fd = open(swap_file_path, O_RDWR);
+        swap_fd = open(SWAP_FILE_PATH, O_RDWR | O_DIRECT);
         if (swap_fd == -1) {
             perror("open swap file");
             return -1;
@@ -82,28 +48,7 @@ static int init_swap_file() {
         }
     } else {
         // File doesn't exist, create it
-        // First ensure the directory exists
-        char dir_path[1024] = {0};
-        char *last_slash = strrchr(swap_file_path, '/');
-        
-        if (last_slash != NULL) {
-            // Copy the directory part
-            size_t dir_len = last_slash - swap_file_path;
-            strncpy(dir_path, swap_file_path, dir_len);
-            dir_path[dir_len] = '\0';
-            
-            // Create directory if it doesn't exist
-            struct stat dir_st;
-            if (stat(dir_path, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
-                printf("Creating directory: %s\n", dir_path);
-                char cmd[1100];
-                snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir_path);
-                system(cmd);
-            }
-        }
-        
-        // Now create the file
-        swap_fd = open(swap_file_path, O_RDWR | O_CREAT, 0666);
+        swap_fd = open(SWAP_FILE_PATH, O_RDWR | O_CREAT | O_DIRECT, 0666);
         if (swap_fd == -1) {
             perror("create swap file");
             return -1;

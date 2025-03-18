@@ -117,7 +117,7 @@ void storage_shutdown() {
 }
 
 // 从swap读取页面
-int read_page(int fd, uint64_t offset, void* dest, size_t size) {
+int swap_process_read_page(int fd, uint64_t offset, void* dest, size_t size) {
     int ret;
     int error_code;
     
@@ -154,7 +154,7 @@ int read_page(int fd, uint64_t offset, void* dest, size_t size) {
 }
 
 // 向swap写入页面
-int write_page(int fd, uint64_t offset, void* src, size_t size) {
+int swap_process_write_page(int fd, uint64_t offset, void* src, size_t size) {
     int ret;
     int error_code;
     

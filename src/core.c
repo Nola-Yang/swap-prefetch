@@ -293,7 +293,14 @@ void extmem_init()
     strcpy(diskpath, SWAPPATH_DEFAULT);
   }  
 
-  diskfd = open(diskpath, O_RDWR | O_DIRECT);
+  struct stat st;
+  if (stat(diskpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+    char swap_file_path[1024];
+    snprintf(swap_file_path, sizeof(swap_file_path), "%s/extmem_swap.bin", diskpath);
+    diskfd = open(swap_file_path, O_RDWR | O_DIRECT);
+  } else {
+    diskfd = open(diskpath, O_RDWR | O_DIRECT);
+  }
   if (diskfd < 0) {
     perror("disk open");
   }
@@ -604,18 +611,18 @@ int extmem_munmap(void* addr, size_t length)
 void extmem_disk_write(int storage_fd, void* src, uint64_t dest, size_t pagesize)
 {
 #ifdef USWAP_SWAP_PROCESS
-    write_page(storage_fd, dest, src, pagesize);
+  swap_process_read_page(storage_fd, src, dest, pagesize);
 #else
-    write_page(storage_fd, dest, src, pagesize);
+  read_page(storage_fd, src, dest, pagesize);
 #endif
 }
 
 void extmem_disk_read(int storage_fd, uint64_t src, void *dest, size_t pagesize)
 {
 #ifdef USWAP_SWAP_PROCESS
-    read_page(storage_fd, src, dest, pagesize);
+  swap_process_read_page(storage_fd, src, dest, pagesize);
 #else
-    read_page(storage_fd, src, dest, pagesize);
+  read_page(storage_fd, src, dest, pagesize);
 #endif
 }
 
