@@ -265,24 +265,6 @@ void extmem_init()
   fprintf(logfile, "extmem_init: started\n" );
 
   fflush(logfile);
-
-
-
-// #ifdef SWAPPER
-//   // SSD Init
-//   // for now only requirement from disk is to have a file descriptor
-//   diskpath = getenv("SWAPDIR");
-//   if(diskpath == NULL) {
-//     diskpath = malloc(sizeof(SWAPPATH_DEFAULT));
-//     strcpy(diskpath, SWAPPATH_DEFAULT);
-//   }  
-
-//   diskfd = open(diskpath, O_RDWR | O_DIRECT);
-//   if (diskfd < 0) {
-//     perror("disk open");
-//   }
-//   assert(diskfd >= 0);
-// #endif
   
 #ifdef SWAPPER
   // SSD Init
@@ -306,7 +288,6 @@ void extmem_init()
   }
   assert(diskfd >= 0);
   
-  // 初始化swap进程
   if (storage_init() != 0) {
     perror("storage_init");
     assert(0);
@@ -611,9 +592,9 @@ int extmem_munmap(void* addr, size_t length)
 void extmem_disk_write(int storage_fd, void* src, uint64_t dest, size_t pagesize)
 {
 #ifdef USWAP_SWAP_PROCESS
-  swap_process_read_page(storage_fd, src, dest, pagesize);
+  swap_process_write_page(storage_fd, dest, src, pagesize);
 #else
-  read_page(storage_fd, src, dest, pagesize);
+  write_page(storage_fd, dest, src, pagesize);
 #endif
 }
 
@@ -625,7 +606,6 @@ void extmem_disk_read(int storage_fd, uint64_t src, void *dest, size_t pagesize)
   read_page(storage_fd, src, dest, pagesize);
 #endif
 }
-
 
 void extmem_migrate_updisk(struct user_page *page, uint64_t dram_offset)
 {

@@ -1,8 +1,10 @@
-#define _GNU_SOURCE
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -14,19 +16,56 @@
 #include "swap_shm.h"
 #include "storage_swap_process.h"
 
-// 全局变量
+// Global variables
 static pid_t swap_process_pid = -1;
 static bool swap_initialized = false;
 static pthread_mutex_t swap_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// 启动swap进程
+// Function to find the swap process executable
+static char* find_swap_process() {
+    const char* paths[] = {
+        "./swap_process",                    // Current directory
+        "../bin/swap_process",               // Bin directory relative to current directory
+        "/usr/local/bin/swap_process",       // System installation path
+        NULL                                 // End marker
+    };
+    
+    // Check environment variable first
+    const char* env_path = getenv("EXTMEM_SWAP_PROCESS_PATH");
+    if (env_path != NULL) {
+        if (access(env_path, X_OK) == 0) {
+            char* path = strdup(env_path);
+            return path;
+        }
+        fprintf(stderr, "Swap process not found at EXTMEM_SWAP_PROCESS_PATH: %s\n", env_path);
+    }
+    
+    // Try each of the predefined paths
+    for (int i = 0; paths[i] != NULL; i++) {
+        if (access(paths[i], X_OK) == 0) {
+            return strdup(paths[i]);
+        }
+    }
+    
+    return NULL;
+}
+
+// Start swap process with improved error handling
 static int start_swap_process() {
-    char *argv[] = {"swap_process", NULL};
+    char* swap_path = find_swap_process();
+    if (swap_path == NULL) {
+        fprintf(stderr, "Failed to find swap process executable\n");
+        return -1;
+    }
+    
+    char *argv[] = {swap_path, NULL};
     char *envp[] = {NULL};
     int ret;
     
-    // 使用posix_spawn启动swap进程
-    ret = posix_spawn(&swap_process_pid, "./swap_process", NULL, NULL, argv, envp);
+    // Use posix_spawn to launch swap process
+    ret = posix_spawn(&swap_process_pid, swap_path, NULL, NULL, argv, envp);
+    free(swap_path);
+    
     if (ret != 0) {
         perror("posix_spawn");
         return -1;
@@ -34,13 +73,34 @@ static int start_swap_process() {
     
     LOG("Swap process started with PID: %d\n", swap_process_pid);
     
-    // 等待进程初始化
-    usleep(100000);  // 100ms
+    // Wait for process to initialize (with a timeout)
+    for (int i = 0; i < 10; i++) {
+        usleep(100000);  // 100ms
+        
+        // Check if process is still running
+        if (kill(swap_process_pid, 0) != 0) {
+            if (errno == ESRCH) {
+                fprintf(stderr, "Swap process exited prematurely\n");
+                return -1;
+            }
+            perror("kill check");
+            return -1;
+        }
+        
+        // Try to connect to shared memory
+        if (swap_shm_init(false) == 0) {
+            // Successful connection, break out of loop
+            return 0;
+        }
+    }
     
-    return 0;
+    // Timeout waiting for swap process to initialize
+    fprintf(stderr, "Timeout waiting for swap process to initialize\n");
+    kill(swap_process_pid, SIGTERM);
+    return -1;
 }
 
-// 初始化存储系统
+// Initialize storage with robust error handling
 int storage_init() {
     int ret;
     
@@ -48,36 +108,41 @@ int storage_init() {
     
     if (swap_initialized) {
         pthread_mutex_unlock(&swap_mutex);
-        return 0;  // 已经初始化
+        return 0;  // Already initialized
     }
     
-    // 启动swap进程
+    // Start swap process
     ret = start_swap_process();
     if (ret != 0) {
         pthread_mutex_unlock(&swap_mutex);
         return -1;
     }
     
-    // 初始化共享内存连接
-    ret = swap_shm_init(false);  // false = client (ExtMem)
-    if (ret != 0) {
-        pthread_mutex_unlock(&swap_mutex);
-        return -1;
-    }
-    
-    // 发送初始化请求
+    // Send initialization request
     uint64_t req_id = swap_submit_request(OP_INIT, 0, 0, 0, NULL);
     if (req_id < 0) {
+        fprintf(stderr, "Failed to submit initialization request\n");
         swap_shm_cleanup(false);
+        kill(swap_process_pid, SIGTERM);
         pthread_mutex_unlock(&swap_mutex);
         return -1;
     }
     
-    // 等待初始化完成
+    // Wait for initialization to complete (with timeout)
     int error_code;
-    ret = swap_wait_request(req_id, &error_code);
+    for (int i = 0; i < 5; i++) {
+        ret = swap_wait_request(req_id, &error_code);
+        if (ret == 0) {
+            break;
+        }
+        
+        usleep(100000);  // 100ms
+    }
+    
     if (ret != 0) {
+        fprintf(stderr, "Timeout waiting for swap process initialization\n");
         swap_shm_cleanup(false);
+        kill(swap_process_pid, SIGTERM);
         pthread_mutex_unlock(&swap_mutex);
         return -1;
     }
@@ -88,7 +153,7 @@ int storage_init() {
     return 0;
 }
 
-// 关闭存储系统
+// Shutdown with improved cleanup
 void storage_shutdown() {
     pthread_mutex_lock(&swap_mutex);
     
@@ -97,80 +162,146 @@ void storage_shutdown() {
         return;
     }
     
-    // 发送关闭请求
+    // Send shutdown request
     uint64_t req_id = swap_submit_request(OP_SHUTDOWN, 0, 0, 0, NULL);
+    
+    // Wait briefly for shutdown to complete
     if (req_id >= 0) {
-        // 等待关闭完成 (可选)
         int error_code;
         swap_wait_request(req_id, &error_code);
     }
     
-    // 清理共享内存
+    // Clean up shared memory
     swap_shm_cleanup(false);
     
-    // 等待swap进程退出
+    // Wait for swap process to exit (with timeout)
     int status;
-    waitpid(swap_process_pid, &status, 0);
+    for (int i = 0; i < 10; i++) {
+        if (waitpid(swap_process_pid, &status, WNOHANG) == swap_process_pid) {
+            break;
+        }
+        
+        usleep(100000);  // 100ms
+    }
+    
+    // Force terminate if still running
+    if (kill(swap_process_pid, 0) == 0) {
+        kill(swap_process_pid, SIGTERM);
+        usleep(100000);  // 100ms
+        
+        // Force kill if still running
+        if (kill(swap_process_pid, 0) == 0) {
+            kill(swap_process_pid, SIGKILL);
+        }
+    }
     
     swap_initialized = false;
     pthread_mutex_unlock(&swap_mutex);
 }
 
-// 从swap读取页面
+// Add retry logic for improved reliability
 int swap_process_read_page(int fd, uint64_t offset, void* dest, size_t size) {
     int ret;
     int error_code;
     
-    // 忽略fd参数，使用offset定位数据
-    
-    // 发送读请求
-    uint64_t req_id = swap_submit_request(OP_READ_PAGE, 0, offset, size, NULL);
-    if (req_id < 0) {
-        return -1;
-    }
-    
-    // 等待读取完成
-    ret = swap_wait_request(req_id, &error_code);
-    if (ret != 0) {
-        return -1;
-    }
-    
-    // 从共享内存复制数据
-    swap_shm_t* shm = get_swap_shm();
-    if (shm == NULL) {
-        return -1;
-    }
-    
-    // 找到请求的buffer_offset
-    for (uint32_t i = 0; i < MAX_QUEUE_SIZE; i++) {
-        if (shm->requests[i].request_id == req_id) {
-            memcpy(dest, shm->page_buffer + shm->requests[i].buffer_offset, size);
+    // Retry loop
+    for (int retry = 0; retry < 3; retry++) {
+        // Send read request
+        uint64_t req_id = swap_submit_request(OP_READ_PAGE, 0, offset, size, NULL);
+        if (req_id < 0) {
+            if (retry == 2) {
+                return -1;
+            }
+            usleep(100000);  // 100ms
+            continue;
+        }
+        
+        // Wait for read to complete (with timeout)
+        for (int i = 0; i < 5; i++) {
+            ret = swap_wait_request(req_id, &error_code);
+            if (ret == 0) {
+                break;
+            }
+            
+            usleep(100000);  // 100ms
+        }
+        
+        if (ret != 0) {
+            if (retry == 2) {
+                return -1;
+            }
+            continue;
+        }
+        
+        // Copy data from shared memory
+        swap_shm_t* shm = get_swap_shm();
+        if (shm == NULL) {
+            if (retry == 2) {
+                return -1;
+            }
+            continue;
+        }
+        
+        // Find request's buffer_offset
+        pthread_mutex_lock(&shm->queue_mutex);
+        uint64_t buffer_offset = 0;
+        bool found = false;
+        for (uint32_t i = 0; i < MAX_QUEUE_SIZE; i++) {
+            if (shm->requests[i].request_id == req_id) {
+                buffer_offset = shm->requests[i].buffer_offset;
+                found = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&shm->queue_mutex);
+        
+        if (found) {
+            memcpy(dest, shm->page_buffer + buffer_offset, size);
             return 0;
+        }
+        
+        // Request not found
+        if (retry == 2) {
+            return -1;
         }
     }
     
-    // 没有找到请求
+    // All retries failed
     return -1;
 }
 
-// 向swap写入页面
+// Add retry logic for writes as well
 int swap_process_write_page(int fd, uint64_t offset, void* src, size_t size) {
     int ret;
     int error_code;
     
-    // 忽略fd参数，使用offset定位数据
-    
-    // 发送写请求
-    uint64_t req_id = swap_submit_request(OP_WRITE_PAGE, 0, offset, size, src);
-    if (req_id < 0) {
-        return -1;
+    // Retry loop
+    for (int retry = 0; retry < 3; retry++) {
+        // Send write request
+        uint64_t req_id = swap_submit_request(OP_WRITE_PAGE, 0, offset, size, src);
+        if (req_id < 0) {
+            if (retry == 2) {
+                return -1;
+            }
+            usleep(100000);  // 100ms
+            continue;
+        }
+        
+        // Wait for write to complete (with timeout)
+        for (int i = 0; i < 5; i++) {
+            ret = swap_wait_request(req_id, &error_code);
+            if (ret == 0) {
+                return 0;
+            }
+            
+            usleep(100000);  // 100ms
+        }
+        
+        if (retry == 2) {
+            return -1;
+        }
     }
     
-    // 等待写入完成
-    ret = swap_wait_request(req_id, &error_code);
-    if (ret != 0) {
-        return -1;
-    }
-    
-    return 0;
+    // All retries failed
+    return -1;
 }

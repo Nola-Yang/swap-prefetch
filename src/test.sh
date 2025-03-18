@@ -1,120 +1,151 @@
 #!/bin/bash
 
-# Test script for ExtMem with Swap Process
+# Configuration
+SWAP_DIR="/tmp/extmem_swap"
+DRAM_SIZE="2G"  # 2GB DRAM limit
+TEST_TIMEOUT=30  # Test timeout in seconds
 
-# 创建 swap 目录
-mkdir -p /tmp/extmem_swap
+# Colors for output
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# 编译代码
+# Cleanup function
+cleanup() {
+    echo -e "\n${YELLOW}Cleaning up...${NC}"
+    
+    # Kill any running processes
+    if [ -n "$TEST_PID" ] && ps -p $TEST_PID > /dev/null 2>&1; then
+        echo "Terminating test program (PID: $TEST_PID)"
+        kill -TERM $TEST_PID 2>/dev/null || true
+    fi
+    
+    if [ -n "$SWAP_PID" ] && ps -p $SWAP_PID > /dev/null 2>&1; then
+        echo "Terminating swap process (PID: $SWAP_PID)"
+        kill -TERM $SWAP_PID 2>/dev/null || true
+        sleep 1
+        # Force kill if still running
+        if ps -p $SWAP_PID > /dev/null 2>&1; then
+            kill -KILL $SWAP_PID 2>/dev/null || true
+        fi
+    fi
+    
+    echo -e "${GREEN}Cleanup complete.${NC}"
+}
+
+# Set trap for cleanup
+trap cleanup EXIT INT TERM
+
+# Create swap directory
+echo -e "${BLUE}Creating swap directory: $SWAP_DIR${NC}"
+mkdir -p "$SWAP_DIR"
+
+# Compile everything
+echo -e "${BLUE}Building ExtMem and swap process...${NC}"
 make clean
-make
+make swap_process
+make libextmem-default.so
 
-# 确保 swap_process 编译成功
+# Verify the binaries exist
 if [ ! -f "./swap_process" ]; then
-  echo "ERROR: Failed to build swap_process"
-  exit 1
+    echo -e "${RED}ERROR: swap_process executable not found!${NC}"
+    exit 1
 fi
 
-# 设置环境变量
-export DRAMSIZE=1073741824  # 1GB
-export SWAPDIR="/tmp/extmem_swap"  # 使用目录路径
+if [ ! -f "./libextmem-default.so" ]; then
+    echo -e "${RED}ERROR: libextmem-default.so not found!${NC}"
+    exit 1
+fi
 
-# 启动 swap process
-echo "Starting swap process..."
+# Ensure executables are executable
+chmod +x ./swap_process
+
+# Compile test program
+echo -e "${BLUE}Compiling test program...${NC}"
+gcc -O2 test_program.c -o test_program -lrt
+if [ ! -f "./test_program" ]; then
+    echo -e "${RED}ERROR: Failed to compile test program!${NC}"
+    exit 1
+fi
+
+# Export environment variables
+export DRAMSIZE=$(numfmt --from=iec $DRAM_SIZE)
+export SWAPDIR="$SWAP_DIR"
+
+echo -e "${GREEN}Using DRAMSIZE=$DRAMSIZE ($DRAM_SIZE)${NC}"
+echo -e "${GREEN}Using SWAPDIR=$SWAP_DIR${NC}"
+
+# Start swap process manually
+echo -e "${BLUE}Starting swap process...${NC}"
 ./swap_process &
 SWAP_PID=$!
 
-# 等待 swap process 启动
+# Wait for swap process to initialize
+echo -e "${BLUE}Waiting for swap process to initialize...${NC}"
 sleep 2
+
+# Verify swap process is running
 if ! ps -p $SWAP_PID > /dev/null; then
-  echo "ERROR: Swap process failed to start"
-  exit 1
+    echo -e "${RED}ERROR: Swap process failed to start!${NC}"
+    exit 1
 fi
 
-# 运行简单测试程序
-echo "Running a simple memory allocation test..."
-cat > test_alloc.c << 'EOF'
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+echo -e "${GREEN}Swap process running with PID: $SWAP_PID${NC}"
 
-#define PAGE_SIZE 4096
-#define MB (1024 * 1024)
-#define ALLOC_SIZE (512 * MB)  // 分配 512MB 内存
+# Display information about the library
+echo -e "${BLUE}Library information:${NC}"
+ls -la ./libextmem-default.so
+file ./libextmem-default.so
 
-int main() {
-    printf("Allocating %d MB of memory...\n", ALLOC_SIZE / MB);
-    
-    // 分配内存
-    char *memory = malloc(ALLOC_SIZE);
-    if (!memory) {
-        perror("malloc failed");
-        return 1;
-    }
-    
-    // 写入数据
-    printf("Writing data to memory...\n");
-    for (size_t i = 0; i < ALLOC_SIZE; i += PAGE_SIZE) {
-        memory[i] = (char)(i % 256);
-    }
-    
-    // 读取并验证数据
-    printf("Reading and verifying data...\n");
-    for (size_t i = 0; i < ALLOC_SIZE; i += PAGE_SIZE) {
-        if (memory[i] != (char)(i % 256)) {
-            printf("Verification failed at offset %zu\n", i);
-            break;
-        }
-    }
-    
-    printf("Memory test completed successfully!\n");
-    
-    // 等待用户输入，让内存保持分配状态
-    printf("Press Enter to exit...");
-    getchar();
-    
-    // 释放内存
-    free(memory);
-    return 0;
-}
-EOF
-
-# 编译测试程序
-gcc -O2 test_alloc.c -o test_alloc
-
-# 使用 ExtMem 运行测试程序
-echo "Running test with ExtMem..."
-LD_PRELOAD=./libextmem-default.so ./test_alloc &
+# Run test program with ExtMem
+echo -e "${BLUE}Running test program with ExtMem...${NC}"
+LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH LD_PRELOAD=$PWD/libextmem-default.so ./swap_test 2 0 1 50 50 &
 TEST_PID=$!
 
-# 等待测试程序退出或超时
-TIMEOUT=30
-for ((i=0; i<TIMEOUT; i++)); do
-    if ! ps -p $TEST_PID > /dev/null; then
-        echo "Test program completed."
-        break
+# Wait for test to complete or timeout
+echo -e "${BLUE}Test running, waiting up to $TEST_TIMEOUT seconds...${NC}"
+waited=0
+while ps -p $TEST_PID > /dev/null && [ $waited -lt $TEST_TIMEOUT ]; do
+    echo -e "${YELLOW}Test running for $waited seconds...${NC}"
+    sleep 5
+    waited=$((waited + 5))
+    
+    # Check swap process is still running
+    if ! ps -p $SWAP_PID > /dev/null; then
+        echo -e "${RED}ERROR: Swap process died during test!${NC}"
+        # Attempt to capture logs or other diagnostics
+        if [ -f "/tmp/extmem_swap.bin" ]; then
+            ls -la /tmp/extmem_swap.bin
+        fi
+        exit 1
     fi
-    echo "Waiting for test to complete... ($i/$TIMEOUT)"
-    sleep 1
 done
 
-# 如果测试程序仍在运行，发送回车键然后终止它
+# Check if test timed out
 if ps -p $TEST_PID > /dev/null; then
-    echo -e "\n" | kill -SIGINT $TEST_PID
-    echo "Test program terminated after timeout."
+    echo -e "${YELLOW}Test reached timeout, terminating...${NC}"
+    kill -TERM $TEST_PID
+    wait $TEST_PID 2>/dev/null || true
+else
+    echo -e "${GREEN}Test completed within time limit!${NC}"
+    # Check exit status
+    wait $TEST_PID
+    TEST_STATUS=$?
+    if [ $TEST_STATUS -eq 0 ]; then
+        echo -e "${GREEN}Test program exited successfully with status 0${NC}"
+    else
+        echo -e "${RED}Test program exited with status $TEST_STATUS${NC}"
+    fi
 fi
 
-# 显示 swap 文件信息
-echo "Swap file info:"
-ls -lh /tmp/extmem_swap/
+# Display swap file information
+echo -e "${BLUE}Swap file information:${NC}"
+ls -la "$SWAP_DIR"
 
-# 终止 swap 进程
-echo "Stopping swap process..."
-kill $SWAP_PID
-sleep 1
+# Display swap process information
+echo -e "${BLUE}Swap process information:${NC}"
+ps -p $SWAP_PID -o pid,ppid,cmd,%cpu,%mem,rss,vsz
 
-# 清理临时文件
-rm -f test_alloc test_alloc.c
-
-echo "Test completed!"
+echo -e "\n${GREEN}Test completed!${NC}"
