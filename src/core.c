@@ -29,6 +29,11 @@
 
 #ifdef USWAP_IOURING
 #include "storage_iouring.h"
+#elif defined(USWAP_RDMA)
+#include "storage_rdma.h"
+#include "rdma_sim.h"
+#define storage_init rdma_storage_init
+#define storage_shutdown rdma_storage_shutdown
 #else
 #include "storagemanager.h"
 #endif

@@ -49,52 +49,40 @@
 # clean:
 # 	$(RM) *.o *.so policies/*.o
 
+# ExtMem Makefile with RDMA support
 CC = gcc
 CFLAGS = -g -Wall -O3 -fPIC -fno-omit-frame-pointer
-#CFLAGS = -g3 -Wall -O0 -fPIC
 LDFLAGS = -shared -fno-omit-frame-pointer
 INCLUDES = -I../linux/usr/include/ -Iinclude/
 LIBS = -lm -lpthread -luring -ldl -lsyscall_intercept -lrt
 
-default: libextmem-default.so swap_process
+default: libextmem-rdma.so rdma_process
 
-all: libextmem-default.so libextmem-pagerank.so swap_process checkpoint_test
+all: libextmem-rdma.so rdma_process
 
-libextmem-default.so: extmem-default.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o swap_common.o
-	$(CC) $(LDFLAGS) -o libextmem-default.so extmem-default.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o swap_common.o $(LIBS)
+# RDMA-enabled ExtMem library
+libextmem-rdma.so: extmem-rdma.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o observability.o
+	$(CC) $(LDFLAGS) -o libextmem-rdma.so extmem-rdma.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o $(LIBS)
 
-libextmem-pagerank.so: extmem-pagerank.o policies/pagerank.o intercept_layer.o fifo.o storagemanager.o storage_iouring.o observability.o swap_shm.o storage_swap_process.o swap_common.o
-	$(CC) $(LDFLAGS) -o libextmem-pagerank.so extmem-pagerank.o policies/pagerank.o intercept_layer.o observability.o fifo.o storagemanager.o storage_iouring.o swap_shm.o storage_swap_process.o swap_common.o $(LIBS)
+# RDMA simulation process
+rdma_process.o: rdma_process.c include/rdma_sim.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c rdma_process.c -o rdma_process.o
 
-swap_common.o: swap_process.c include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -DBUILD_COMMON -c swap_process.c -o swap_common.o
+rdma_process: rdma_process.o rdma_sim.o
+	$(CC) -o rdma_process rdma_process.o rdma_sim.o -lpthread -lrt
 
-swap_process.o: swap_process.c include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -DBUILD_EXECUTABLE -c swap_process.c -o swap_process.o
+# ExtMem with RDMA support
+extmem-rdma.o: core.c core.h policies/disklinux.h intercept_layer.h observability.h fifo.h storagemanager.h include/rdma_sim.h include/storage_rdma.h
+	$(CC) $(CFLAGS) $(INCLUDES) -D ALLOC_DISK -D LRU_SWAP -D USWAP_RDMA -c core.c -o extmem-rdma.o
 
-swap_process: swap_process.o swap_shm.o
-	$(CC) -o swap_process swap_process.o swap_shm.o -lpthread -lrt
+# RDMA simulation components
+rdma_sim.o: rdma_sim.c include/rdma_sim.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c rdma_sim.c
 
-# Checkpoint
-checkpoint_test: checkpoint_test.o
-	$(CC) -o checkpoint_test checkpoint_test.o -L. -lextmem-default -lpthread -lrt
+storage_rdma.o: storage_rdma.c include/storage_rdma.h include/rdma_sim.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c storage_rdma.c
 
-checkpoint_test.o: checkpoint_test.c include/storage_swap_process.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c checkpoint_test.c
-
-
-extmem-default.o: core.c core.h policies/disklinux.h intercept_layer.h observability.h fifo.h storagemanager.h include/swap_shm.h include/storage_swap_process.h
-	$(CC) $(CFLAGS) $(INCLUDES) -D ALLOC_DISK -D LRU_SWAP -D USWAP_SWAP_PROCESS -c core.c -o extmem-default.o
-
-extmem-pagerank.o: core.c core.h policies/pageRank.h intercept_layer.h observability.h fifo.h storagemanager.h include/swap_shm.h include/storage_swap_process.h
-	$(CC) $(CFLAGS) $(INCLUDES) -D ALLOC_DISK -D PAGE_RANK -D LRU_SWAP -D USWAP_SWAP_PROCESS -c core.c -o extmem-pagerank.o
-
-swap_shm.o: swap_shm.c include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c swap_shm.c
-
-storage_swap_process.o: storage_swap_process.c include/storage_swap_process.h include/swap_shm.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c storage_swap_process.c
-
+# Shared components
 observability.o: observability.c observability.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c observability.c
 
@@ -107,12 +95,6 @@ timer.o: timer.c timer.h
 policies/default.o: policies/disklinux.c policies/disklinux.h observability.h core.h fifo.h storagemanager.h
 	$(CC) $(CFLAGS) $(INCLUDES) -D LRU_SWAP -D ALLOC_DISK -c policies/disklinux.c -o policies/default.o
 
-policies/pagerank.o: policies/pageRank.c policies/pageRank.h observability.h core.h fifo.h storagemanager.h
-	$(CC) $(CFLAGS) $(INCLUDES) -D LRU_SWAP -D ALLOC_DISK -D PAGE_RANK -c policies/pageRank.c -o policies/pagerank.o
-
-storage_iouring.o: storage_iouring.c storage_iouring.h core.h fifo.h
-	$(CC) $(CFLAGS) $(INCLUDES) -c storage_iouring.c
-
 storagemanager.o: storagemanager.c storagemanager.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c storagemanager.c
 
@@ -120,4 +102,4 @@ fifo.o: fifo.c fifo.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c fifo.c
 
 clean:
-	$(RM) *.o *.so policies/*.o swap_process checkpoint_test
+	$(RM) *.o *.so policies/*.o rdma_process
