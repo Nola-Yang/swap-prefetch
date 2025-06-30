@@ -21,7 +21,9 @@ void (*libc_free)(void* ptr) = NULL;
 static int mmap_filter(void *addr, size_t length, int prot, int flags, int fd, off_t offset, uint64_t *result)
 {
   
-  LOG("mmap interposed: 0x%lx, %ld\n", (uint64_t)addr, length);
+  printf("DEBUG: mmap_filter called: addr=0x%lx, length=%ld (%ld MB), flags=0x%x\n", (uint64_t)addr, length, length/(1024*1024), flags);
+  fflush(stdout);
+  LOG("mmap interposed: addr=0x%lx, length=%ld (%ld MB), flags=0x%x\n", (uint64_t)addr, length, length/(1024*1024), flags);
   LOGFLUSH();
   
   // We don't cover file mappings in this version
@@ -57,21 +59,25 @@ static int mmap_filter(void *addr, size_t length, int prot, int flags, int fd, o
   }
 
   // bypassing the smaller mappings in this version
-  if (length < 2UL * 1024UL * 1024UL * 1024UL) {
+  if (length < 1024*1024UL*2 ) {  // Changed to 1MB threshold to allow 2MB test allocations
     LOG("syscall_intercept: calling native mmap for a small allocation: mmap(0x%lx, %ld, %x, %x, %d, %ld)\n", (uint64_t)addr, length, prot, flags, fd, offset);
     LOGFLUSH();
   
     return 1;
   }
 
-  LOG("syscall_intercept: mmap redirected to extmem: mmap(0x%lx, %ld, %x, %x, %d, %ld)\n", (uint64_t)addr, length, prot, flags, fd, offset);
+  LOG("syscall_intercept: mmap redirected to extmem: length=%ld (%ld MB), flags=0x%x\n", length, length/(1024*1024), flags);
   LOGFLUSH();
   if ((*result = (uint64_t)extmem_mmap(addr, length, prot, flags, fd, offset)) == (uint64_t)MAP_FAILED) {
     // TODO: handle extmem mmap fails gracefully
-    LOG("extmem mmap failed\n\tmmap(0x%lx, %ld, %x, %x, %d, %ld)\n", (uint64_t)addr, length, prot, flags, fd, offset);
+    // LOG("ERROR: extmem mmap failed for %ld bytes (%ld MB)\n", length, length/(1024*1024));
+    LOG("ERROR: extmem mmap failed for %ld bytes (%ld MB)\n", length, length/(1024*1024));
     LOGFLUSH();
   
-  }
+  // } else {
+  //   LOG("SUCCESS: extmem mmap returned address 0x%lx for %ld bytes\n", *result, length);
+  //   LOGFLUSH();
+   }
   return 0;
 }
 

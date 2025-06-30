@@ -1,0 +1,70 @@
+// {
+//   "version": "0.2.0",
+//   "configurations": [
+//     {
+//       "name": "Debug extmem",
+//       "type": "cppdbg",
+//       "request": "launch",
+//       "MIMode": "gdb",
+//       "program": "/home/yjiayue/jiayue/ExtMem/src/test_pointer_prefetch",
+//       "cwd": "/home/yjiayue/jiayue/ExtMem/src",           // <-- 同目录
+//       "console": "integratedTerminal",      // 内嵌终端
+//       "env": {
+//         "EXTMEM_DRAMSIZE": "5MB",
+//         "EXTMEM_SWAPFILE": "/home/yjiayue/jiayue/ExtMem/src/test_swap.dat",
+//         "LD_PRELOAD": "/home/yjiayue/jiayue/ExtMem/src/libextmem-rdma.so"
+//       },
+//       "stopAtEntry": false                  // 先别记录 log，确保能跑
+//     }
+//   ]
+// }
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // ——— 基本信息 ———
+      "name": "Debug extmem + libextmem-rdma",
+      "type": "cppdbg",
+      "request": "launch",
+      "MIMode": "gdb",
+
+      // ——— 主程序 & 工作目录 ———
+      "program": "/home/yjiayue/jiayue/ExtMem/src/test_pointer_prefetch",
+      "cwd": "/home/yjiayue/jiayue/ExtMem/src",
+
+      // ——— 终端 ———
+      "externalConsole": false,             // 防止外部终端打不开卡死
+
+      // ——— 环境变量 ———
+      "environment": [
+        {
+          "name": "DRAMSIZE",
+          "value": "8192"
+        },
+        {
+          "name": "EXTMEM_SWAPFILE",
+          "value": "/home/yjiayue/jiayue/ExtMem/src/test_swap.dat"
+        },
+        {
+          "name": "LD_PRELOAD",
+          "value": "/home/yjiayue/jiayue/ExtMem/src/libextmem-rdma.so"
+        }
+      ],
+
+      // ——— 关键：让 GDB 找到 .so 和源码，并接受“待定断点” ———
+      "setupCommands": [
+        { "text": "set breakpoint pending on" },                             // 库加载前也能下断点
+        { "text": "set solib-search-path /home/yjiayue/jiayue/ExtMem/src" }, // .so 所在目录
+        { "text": "directory /home/yjiayue/jiayue/ExtMem/src" },             // 源码目录
+        // 可选：想启动就停在 .so 里的函数
+        { "text": "break rdma_read" },
+        { "text": "break rdma_write" }
+      ],
+
+      // ——— 如果需要自动编译，可解开这一行并在 tasks.json 里建任务 ———
+      // "preLaunchTask": "build-extmem",
+
+      "stopAtEntry": false      // true = 停在 main；false = 直接运行到第一个断点
+    }
+  ]
+}

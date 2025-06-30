@@ -1,0 +1,2 @@
+extmem_init: started
+extmem_init: completed

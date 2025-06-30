@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +18,11 @@
 static int rdma_server_handle_request(rdma_request_t* req);
 
 static rdma_shm_t* rdma_shm = NULL;
-static int shm_id = -1;
+static int shmid = -1; 
 static bool is_initialized = false; // Local init flag for client/server status
 static atomic_uint_fast64_t request_id_counter = 1; // Start from 1, 0 can mean error
 
-// 远程内存分配器
-#define SIM_REMOTE_MEMORY_SIZE (1ULL * 1024 * 1024 * 1024)  // 1GB远程内存 for simulation
+#define SIM_REMOTE_MEMORY_SIZE (1ULL * 1024 * 1024 * 1024)  
 #define SIM_REMOTE_MEMORY_ALIGN 4096
 
 typedef struct mem_block {
@@ -36,14 +36,12 @@ static mem_block_t* sim_remote_memory_blocks = NULL;
 static pthread_mutex_t sim_mem_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char* sim_remote_memory_ptr = NULL; // Pointer to the simulated server's memory block
 
-// 获取时间戳
 uint64_t rdma_get_timestamp(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000000ULL + tv.tv_usec;
 }
 
-// 初始化远程内存分配器
 static int init_sim_remote_memory_allocator(void) {
     pthread_mutex_lock(&sim_mem_alloc_mutex);
     
@@ -71,11 +69,10 @@ static int init_sim_remote_memory_allocator(void) {
         sim_remote_memory_blocks->free = true;
         sim_remote_memory_blocks->next = NULL;
         
-        // These are for the *shared memory metadata*, not the server's actual memory size
-        // rdma_shm->remote_memory_base reflects this conceptual base
-        if (rdma_shm) { // rdma_shm might not be set yet if called before shmat
-             rdma_shm->remote_memory_base = sim_remote_memory_blocks->addr; // Direct assignment
-             rdma_shm->remote_memory_size = SIM_REMOTE_MEMORY_SIZE; // Direct assignment
+        
+        if (rdma_shm) { 
+             rdma_shm->remote_memory_base = sim_remote_memory_blocks->addr; 
+             rdma_shm->remote_memory_size = SIM_REMOTE_MEMORY_SIZE; 
              atomic_store(&rdma_shm->remote_memory_used, 0);
         }
     }
@@ -84,7 +81,6 @@ static int init_sim_remote_memory_allocator(void) {
     return 0;
 }
 
-// 分配远程内存
 int rdma_sim_allocate(size_t size, uint64_t* remote_addr) {
     if (remote_addr == NULL || size == 0) return EINVAL;
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) return ENOTCONN;
@@ -120,7 +116,6 @@ int rdma_sim_allocate(size_t size, uint64_t* remote_addr) {
     return ENOMEM;
 }
 
-// 释放远程内存
 int rdma_sim_free(uint64_t remote_addr) {
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) return ENOTCONN;
 
@@ -162,142 +157,182 @@ int rdma_sim_free(uint64_t remote_addr) {
     return EINVAL;
 }
 
-// 获取共享内存
 rdma_shm_t* get_rdma_shm(void) {
+    if (rdma_shm == NULL) {
+        fprintf(stderr, "GET_RDMA_SHM (PID %d): Shared memory not initialized by this process yet. Attempting client init...\n", getpid());
+        if (rdma_sim_init(false /*is_server*/) != 0) {
+            fprintf(stderr, "GET_RDMA_SHM (PID %d): Client-side rdma_sim_init failed within get_rdma_shm.\n", getpid());
+            return NULL; 
+        }
+        fprintf(stderr, "GET_RDMA_SHM (PID %d): Client-side rdma_sim_init succeeded. rdma_shm: %p\n", getpid(), (void*)rdma_shm);
+    }
     return rdma_shm;
 }
 
-// 初始化RDMA模拟
 int rdma_sim_init(bool is_server) {
     if (is_initialized && rdma_shm != NULL && atomic_load(&rdma_shm->initialized)) {
         return 0; // Already initialized correctly
     }
     
-    shm_id = shmget(RDMA_SHM_KEY, sizeof(rdma_shm_t), is_server ? (IPC_CREAT | IPC_EXCL | 0666) : 0666);
-    if (shm_id == -1) {
-        if (is_server && errno == EEXIST) { // Server: SHM already exists, try to attach and use/clean
-            shm_id = shmget(RDMA_SHM_KEY, sizeof(rdma_shm_t), 0666);
-            if (shm_id == -1) { perror("shmget (server, EEXIST recovery)"); return -1; }
-            // If successful, proceed to attach, but may need cleanup logic if state is bad
-        } else {
-            perror(is_server ? "shmget (server, create)" : "shmget (client)");
-            return -1;
-        }
-    }
-    
-    rdma_shm = (rdma_shm_t*)shmat(shm_id, NULL, 0);
-    if (rdma_shm == (void*)-1) {
-        perror("shmat");
-        rdma_shm = NULL; // Ensure rdma_shm is NULL on failure
-        if (is_server && shm_id != -1) shmctl(shm_id, IPC_RMID, NULL); // Clean up if server created it then failed to attach
-        return -1;
-    }
-    
     if (is_server) {
-        // Initialize server's simulated memory first, as it's used by rdma_shm metadata init
-        if (init_sim_remote_memory_allocator() != 0) {
-             // Cleanup shm before returning
-            shmdt(rdma_shm); rdma_shm = NULL;
-            shmctl(shm_id, IPC_RMID, NULL); shm_id = -1;
+        fprintf(stderr, "RDMA_SIM_SERVER: Initializing shared memory (key: %d)...\n", RDMA_SHM_KEY);
+        shmid = shmget(RDMA_SHM_KEY, sizeof(rdma_shm_t), IPC_CREAT | 0666);
+        if (shmid == -1) {
+            perror("RDMA_SIM_SERVER: shmget failed");
+            fprintf(stderr, "RDMA_SIM_SERVER: shmget errno: %d\n", errno);
             return -1;
         }
+        fprintf(stderr, "RDMA_SIM_SERVER: shmget successful, shmid: %d\n", shmid);
 
-        memset(rdma_shm, 0, sizeof(rdma_shm_t)); // Zero out shared memory
+        void* shm_ptr = shmat(shmid, NULL, 0);
+        if (shm_ptr == (void*)-1) {
+            perror("RDMA_SIM_SERVER: shmat failed");
+            fprintf(stderr, "RDMA_SIM_SERVER: shmat errno: %d\n", errno);
+            shmctl(shmid, IPC_RMID, NULL);
+            return -1;
+        }
+        fprintf(stderr, "RDMA_SIM_SERVER: shmat successful, shm_ptr: %p\n", shm_ptr);
+
+        rdma_shm = (rdma_shm_t*)shm_ptr;
+        fprintf(stderr, "RDMA_SIM_SERVER: rdma_shm structure mapped at %p\n", (void*)rdma_shm);
         
+        memset(rdma_shm, 0, sizeof(rdma_shm_t)); // Zero out the entire structure first
+
         pthread_mutexattr_t mutex_attr;
         pthread_mutexattr_init(&mutex_attr);
         pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
         pthread_mutex_init(&rdma_shm->queue_mutex, &mutex_attr);
         pthread_mutexattr_destroy(&mutex_attr);
-        
+
         pthread_condattr_t cond_attr;
         pthread_condattr_init(&cond_attr);
         pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
         pthread_cond_init(&rdma_shm->queue_cond, &cond_attr);
         pthread_condattr_destroy(&cond_attr);
         
+        // Initialize atomic variables for the queue management
         atomic_init(&rdma_shm->head, 0);
         atomic_init(&rdma_shm->tail, 0);
         atomic_init(&rdma_shm->count, 0);
+
+        atomic_init(&rdma_shm->initialized, false); // Server will set to true after full init
         atomic_init(&rdma_shm->shutdown_requested, false);
-        // Initialize non-atomic fields directly
-        rdma_shm->remote_memory_base = sim_remote_memory_blocks ? sim_remote_memory_blocks->addr : 0;
-        rdma_shm->remote_memory_size = sim_remote_memory_blocks ? SIM_REMOTE_MEMORY_SIZE : 0;
+
+        // Initialize statistics and other atomic fields
         atomic_init(&rdma_shm->remote_memory_used, 0);
         atomic_init(&rdma_shm->total_requests, 0);
         atomic_init(&rdma_shm->completed_requests, 0);
         atomic_init(&rdma_shm->failed_requests, 0);
         atomic_init(&rdma_shm->page_buffer_used, 0);
-        
-        atomic_store(&rdma_shm->initialized, true); // Mark shm as initialized
-    } else { // Client
-        int timeout = 100; 
-        while (!atomic_load(&rdma_shm->initialized) && timeout > 0) {
-            usleep(100000); 
-            timeout--;
+
+        // Initialize simulated remote memory allocator (server only)
+        if (init_sim_remote_memory_allocator() != 0) {
+             fprintf(stderr, "RDMA_SIM_SERVER: Failed to initialize simulated remote memory allocator.\n");
+             shmdt(shm_ptr);
+             shmctl(shmid, IPC_RMID, NULL);
+             rdma_shm = NULL;
+             return -1;
         }
-        if (!atomic_load(&rdma_shm->initialized)) {
-            fprintf(stderr, "Timeout waiting for RDMA server initialization\n");
-            shmdt(rdma_shm); rdma_shm = NULL; // Detach on failure
-            // Don't remove shm as client
+        fprintf(stderr, "RDMA_SIM_SERVER: Simulated remote memory initialized, sim_remote_memory_ptr: %p\n", sim_remote_memory_ptr);
+
+        atomic_store(&rdma_shm->initialized, true); // Mark shm as initialized by server
+        fprintf(stderr, "RDMA_SIM_SERVER: Initialization complete. Shared memory marked as initialized.\n");
+
+    } else { // Client
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): Attaching to shared memory (key: %d)...\n", getpid(), RDMA_SHM_KEY);
+        shmid = shmget(RDMA_SHM_KEY, 0, 0);
+        if (shmid == -1) {
+            perror("RDMA_SIM_CLIENT: shmget failed to find/access segment");
+            fprintf(stderr, "RDMA_SIM_CLIENT: shmget errno: %d (%s)\n", errno, strerror(errno));
             return -1;
         }
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): shmget successful, shmid: %d\n", getpid(), shmid);
+
+        void* shm_ptr = shmat(shmid, NULL, 0);
+        if (shm_ptr == (void*)-1) {
+            perror("RDMA_SIM_CLIENT: shmat failed");
+            fprintf(stderr, "RDMA_SIM_CLIENT: shmat errno: %d (%s)\n", errno, strerror(errno));
+            return -1;
+        }
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): shmat successful, shm_ptr: %p\n", getpid(), shm_ptr);
+        
+        rdma_shm = (rdma_shm_t*)shm_ptr;
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): rdma_shm structure mapped at %p\n", getpid(), (void*)rdma_shm);
+
+        int timeout = 200; // 20 seconds (200 * 100ms)
+        bool server_initialized = false;
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): Waiting for server to initialize shared memory (timeout %d s)...\n", getpid(), timeout/10);
+        while (timeout > 0) {
+            if (atomic_load(&rdma_shm->initialized)) {
+                server_initialized = true;
+                break;
+            }
+            usleep(100000); 
+            timeout--;
+            if(timeout % 50 == 0 && timeout > 0) { // Print every 5 seconds
+                 fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): Still waiting for server init (%d s remaining)...\n", getpid(), timeout/10);
+            }
+        }
+        if (!server_initialized) {
+            fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): Timeout waiting for RDMA server to initialize shared memory.\n", getpid());
+            shmdt(shm_ptr);
+            rdma_shm = NULL;
+            return -1; 
+        }
+        fprintf(stderr, "RDMA_SIM_CLIENT (PID %d): Server is initialized. Client attachment successful.\n", getpid());
     }
     
     is_initialized = true; // Local flag
     return 0;
 }
 
-// 清理RDMA模拟
+
 void rdma_sim_cleanup(bool is_server) {
+    fprintf(stderr, "RDMA_SIM_CLEANUP (PID %d, is_server: %d): Starting cleanup.\n", getpid(), is_server);
     if (rdma_shm != NULL) {
         if (is_server) {
             atomic_store(&rdma_shm->shutdown_requested, true);
-            pthread_cond_broadcast(&rdma_shm->queue_cond); // Wake up server thread if waiting
-            // Give server thread a moment to exit its loop
-            usleep(10000); 
-
-            pthread_mutex_destroy(&rdma_shm->queue_mutex);
-            pthread_cond_destroy(&rdma_shm->queue_cond);
+            // Potentially signal or join server processing thread if it's more complex
+            fprintf(stderr, "RDMA_SIM_SERVER: Shutdown requested. Detaching and removing shared memory (shmid: %d)...\n", shmid);
         }
-        shmdt(rdma_shm);
+        if (shmdt(rdma_shm) == -1) {
+            perror("RDMA_SIM_CLEANUP: shmdt failed");
+        } else {
+            fprintf(stderr, "RDMA_SIM_CLEANUP (PID %d, is_server: %d): shmdt successful.\n", getpid(), is_server);
+        }
         rdma_shm = NULL;
     }
-    
-    if (is_server && shm_id != -1) {
-        shmctl(shm_id, IPC_RMID, NULL);
-        shm_id = -1;
-    }
 
-    // Server also cleans up its simulated memory
-    if (is_server) {
-        pthread_mutex_lock(&sim_mem_alloc_mutex);
-        if (sim_remote_memory_ptr) {
-            free(sim_remote_memory_ptr);
-            sim_remote_memory_ptr = NULL;
+    if (is_server && shmid != -1) {
+        if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+            perror("RDMA_SIM_SERVER: shmctl IPC_RMID failed");
+        } else {
+            fprintf(stderr, "RDMA_SIM_SERVER: shmctl IPC_RMID successful for shmid: %d.\n", shmid);
         }
-        mem_block_t* current = sim_remote_memory_blocks;
-        while (current != NULL) {
-            mem_block_t* next = current->next;
-            free(current);
-            current = next;
-        }
-        sim_remote_memory_blocks = NULL;
-        pthread_mutex_unlock(&sim_mem_alloc_mutex);
+        shmid = -1;
     }
+    
+    if (is_server && sim_remote_memory_ptr != NULL) {
+        fprintf(stderr, "RDMA_SIM_SERVER: Freeing simulated remote memory at %p.\n", sim_remote_memory_ptr);
+        free(sim_remote_memory_ptr);
+        sim_remote_memory_ptr = NULL;
+    }
+    fprintf(stderr, "RDMA_SIM_CLEANUP (PID %d, is_server: %d): Cleanup finished.\n", getpid(), is_server);
     is_initialized = false;
 }
 
-// 提交RDMA请求
 uint64_t rdma_submit_request(rdma_op_type_e op_type, uint64_t local_addr, 
                             uint64_t remote_addr, size_t size, void* data) {
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) {
+        fprintf(stderr, "DEBUG: rdma_submit_request failed - shm not initialized\n");
         return 0; 
     }
     
     pthread_mutex_lock(&rdma_shm->queue_mutex);
     
-    if (atomic_load(&rdma_shm->count) >= MAX_RDMA_REQUESTS) {
+    uint32_t count = atomic_load(&rdma_shm->count);
+    if (count >= MAX_RDMA_REQUESTS) {
+        fprintf(stderr, "DEBUG: rdma_submit_request failed - queue full (%u >= %d)\n", count, MAX_RDMA_REQUESTS);
         pthread_mutex_unlock(&rdma_shm->queue_mutex);
         return 0; 
     }
@@ -330,22 +365,26 @@ uint64_t rdma_submit_request(rdma_op_type_e op_type, uint64_t local_addr,
             return 0;
         }
     }
-    // For RDMA_OP_READ, client expects data in its local_addr. Server will write to shm->page_buffer first.
-    // Client will copy from shm->page_buffer to local_addr in rdma_wait_request.
-    // Server needs to know where to put data in page_buffer. Let's assume offset 0 for RDMA_OP_READ server write to shm.
-    // So, req->buffer_offset = 0 for server to write to start of page_buffer.
     
     atomic_store(&rdma_shm->tail, (index + 1) % MAX_RDMA_REQUESTS);
-    atomic_fetch_add(&rdma_shm->count, 1);
+    uint32_t new_count = atomic_fetch_add(&rdma_shm->count, 1) + 1;
     atomic_fetch_add(&rdma_shm->total_requests, 1);
     
-    pthread_cond_signal(&rdma_shm->queue_cond);
+    // Force memory barrier to ensure all writes are visible
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    
+    fprintf(stderr, "DEBUG: Request queued. Queue state: head=%u, tail=%u, count=%u\n", 
+            atomic_load(&rdma_shm->head), atomic_load(&rdma_shm->tail), new_count);
+    fprintf(stderr, "DEBUG: About to signal condition variable (count=%u)\n", new_count);
+    
+    // Broadcast to wake up all waiting threads/processes
+    pthread_cond_broadcast(&rdma_shm->queue_cond);
+    fprintf(stderr, "DEBUG: Condition variable broadcast successfully\n");
     pthread_mutex_unlock(&rdma_shm->queue_mutex);
     
     return req_id;
 }
 
-// 等待请求完成
 int rdma_wait_request(uint64_t request_id, int* error_code) {
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) {
         if(error_code) *error_code = ENOTCONN;
@@ -362,13 +401,9 @@ int rdma_wait_request(uint64_t request_id, int* error_code) {
 
     for(int k=0; k < attempts; k++) {
         rdma_request_t* req_ptr = NULL;
-        // This search could be slow. Client could also store the index from submit_request.
-        // For now, search all slots. This search itself should be safe if request_id is stable after submission.
+        
         for (uint32_t i = 0; i < MAX_RDMA_REQUESTS; i++) { 
-            // A potential issue: if requests are overwritten quickly, this might pick the wrong one
-            // if request IDs are not unique enough over time or if MAX_RDMA_REQUESTS is too small.
-            // Assuming request_id is unique enough for in-flight/recent requests.
-            // A lock around this loop or a generation count per slot could make it safer.
+            
             if (rdma_shm->requests[i].request_id == request_id && atomic_load(&rdma_shm->requests[i].status) != 0 /*not empty or recycled*/) {
                 req_ptr = &rdma_shm->requests[i];
                 break;
@@ -377,9 +412,7 @@ int rdma_wait_request(uint64_t request_id, int* error_code) {
 
         if (!req_ptr) {
             if(error_code) *error_code = ENOENT; // No such request (or already gone)
-            // This could happen if request_id is bad, or if it completed and was cleaned up very fast
-            // which shouldn't happen if client holds the only reference for waiting.
-            // Let's assume for now a valid request_id will be found if it's truly pending/completed.
+            
              if (k > attempts / 2) { // If not found after some time, assume it's a bad ID
                 return -1;
             }
@@ -401,8 +434,7 @@ int rdma_wait_request(uint64_t request_id, int* error_code) {
                     return -1;
                  }
             }
-            // Consider marking request as consumed or cleaning up slot if client won't wait again.
-            // For now, status remains COMPLETED.
+            
             return 0; 
         } else if (status == RDMA_REQ_FAILED) {
             if(error_code) *error_code = req_ptr->error_code;
@@ -416,7 +448,6 @@ int rdma_wait_request(uint64_t request_id, int* error_code) {
     return -1;
 }
 
-// 服务器端处理请求
 int rdma_server_process_requests(void) {
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) {
         return -1;
@@ -426,10 +457,23 @@ int rdma_server_process_requests(void) {
         pthread_mutex_lock(&rdma_shm->queue_mutex);
         
         while (atomic_load(&rdma_shm->count) == 0 && !atomic_load(&rdma_shm->shutdown_requested)) {
+            fprintf(stderr, "DEBUG_SERVER: Waiting for requests (count=%u)...\n", atomic_load(&rdma_shm->count));
+            
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 1; 
-            pthread_cond_timedwait(&rdma_shm->queue_cond, &rdma_shm->queue_mutex, &ts);
+            int wait_ret = pthread_cond_timedwait(&rdma_shm->queue_cond, &rdma_shm->queue_mutex, &ts);
+            if (wait_ret != 0 && wait_ret != ETIMEDOUT) {
+                fprintf(stderr, "DEBUG_SERVER: pthread_cond_timedwait failed: %d\n", wait_ret);
+            }
+            
+            // Force memory barrier and re-check count after waking up
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            uint32_t current_count = atomic_load(&rdma_shm->count);
+            if (current_count > 0) {
+                fprintf(stderr, "DEBUG_SERVER: Detected requests after wakeup (count=%u)\n", current_count);
+                break;
+            }
         }
         
         if (atomic_load(&rdma_shm->shutdown_requested)) {
@@ -441,6 +485,9 @@ int rdma_server_process_requests(void) {
             uint32_t index = atomic_load(&rdma_shm->head);
             rdma_request_t* req = &rdma_shm->requests[index];
             
+            fprintf(stderr, "DEBUG_SERVER: Processing request at index %u, id=%lu, op=%d\n", 
+                    index, req->request_id, req->op_type);
+            
             // Atomically try to change PENDING to PROCESSING
             int expected_status = RDMA_REQ_PENDING;
             if (atomic_compare_exchange_strong(&req->status, &expected_status, RDMA_REQ_PROCESSING)) {
@@ -451,18 +498,19 @@ int rdma_server_process_requests(void) {
                 if (result == 0) {
                     atomic_store(&req->status, RDMA_REQ_COMPLETED);
                     atomic_fetch_add(&rdma_shm->completed_requests, 1);
+                    fprintf(stderr, "DEBUG_SERVER: Request %lu completed successfully\n", req->request_id);
                 } else {
                     req->error_code = result; 
                     atomic_store(&req->status, RDMA_REQ_FAILED);
                     atomic_fetch_add(&rdma_shm->failed_requests, 1);
+                    fprintf(stderr, "DEBUG_SERVER: Request %lu failed with error %d\n", req->request_id, result);
                 }
             } else if (expected_status == RDMA_REQ_PROCESSING) {
-                // Another server thread is processing, or it's already done/failed. Skip.
-                // This case is less likely if only one server thread.
+                
+                fprintf(stderr, "DEBUG_SERVER: Request %lu already being processed\n", req->request_id);
             } else {
-                // Already completed or failed by some other means, or an invalid state.
-                // This means the request was somehow processed or changed status out of band.
-                // For robust queue, this req should be skipped.
+                
+                fprintf(stderr, "DEBUG_SERVER: Request %lu in unexpected state %d\n", req->request_id, expected_status);
             }
             
             atomic_store(&rdma_shm->head, (index + 1) % MAX_RDMA_REQUESTS);
@@ -475,11 +523,9 @@ int rdma_server_process_requests(void) {
     return 0;
 }
 
-// 处理单个请求
 static int rdma_server_handle_request(rdma_request_t* req) {
     if (!sim_remote_memory_ptr && req->op_type != RDMA_OP_INIT && req->op_type != RDMA_OP_SHUTDOWN) {
-        // This check ensures simulated memory is available for ops that need it
-        // init_sim_remote_memory_allocator should have been called by server's rdma_sim_init
+       
         fprintf(stderr, "Simulated remote memory not initialized for RDMA op %d\n", req->op_type);
         return EFAULT; 
     }
@@ -488,8 +534,7 @@ static int rdma_server_handle_request(rdma_request_t* req) {
 
     switch (req->op_type) {
         case RDMA_OP_INIT:
-            // Server side initialization of sim_remote_memory_ptr is done in rdma_sim_init.
-            // This op could be used for other sync if needed.
+        
             return 0;
             
         case RDMA_OP_READ: // Server reads from its conceptual remote_addr, writes to shm->page_buffer
@@ -523,8 +568,15 @@ static int rdma_server_handle_request(rdma_request_t* req) {
                    req->size);
             return 0; 
 
-        case RDMA_OP_ALLOCATE: // Should be handled by client side via rdma_sim_allocate directly
-            return ENOSYS; 
+        case RDMA_OP_ALLOCATE: {
+            uint64_t remote_addr;
+            int alloc_ret = rdma_sim_allocate(req->size, &remote_addr);
+            if (alloc_ret == 0) {
+                req->remote_addr = remote_addr;  
+                return 0;
+            }
+            return alloc_ret;
+        } 
             
         case RDMA_OP_FREE: // Should be handled by client side via rdma_sim_free directly
             return ENOSYS;
@@ -538,7 +590,6 @@ static int rdma_server_handle_request(rdma_request_t* req) {
     }
 }
 
-// 打印统计信息
 void rdma_print_stats(void) {
     if (rdma_shm == NULL || !atomic_load(&rdma_shm->initialized)) {
         printf("RDMA Sim not initialized, no stats.\n");

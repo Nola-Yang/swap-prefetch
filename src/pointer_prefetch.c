@@ -9,12 +9,13 @@
 #include <sys/ioctl.h> // For ioctl
 #include <linux/userfaultfd.h> // For UFFDIO_COPY
 
-#include "extmem_test_env/ExtMem/src/core.h" // Provides struct user_page, find_page, PAGE_SIZE
-#include "extmem_test_env/ExtMem/src/intercept_layer.h" // For libc_malloc/free/mmap
+#include "core.h" // Provides struct user_page, find_page, PAGE_SIZE
+#include "intercept_layer.h" // For libc_malloc/free/mmap
 #include "include/pointer_prefetch.h"
 #include "include/storage_rdma.h" // For rdma_read_page (which uses rdma_sim internally)
 #include "include/rdma_sim.h"     // For rdma_sim_allocate, rdma_sim_free, rdma_submit_request, rdma_wait_request
-#include "extmem_test_env/ExtMem/src/observability.h"  // For LOG, if used
+#include "include/address_translation.h" // For pointer relocation
+#include "observability.h"  // For LOG
 
 static prefetch_record_t *prefetch_records_head = NULL;
 static pthread_mutex_t prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -25,6 +26,9 @@ static uint64_t max_prefetch_distance_g = MAX_PREFETCH_DISTANCE;
 static uint64_t pointer_validation_threshold_g = PREFETCH_VALIDATION_THRESHOLD;
 
 int pointer_prefetch_init(void) {
+    // fprintf(stderr, "DEBUG_PREFETCHER: pointer_prefetch_init() CALLED AND EXECUTING!\n");
+    // fflush(stderr);
+
     pthread_mutex_lock(&prefetch_mutex);
     
     if (prefetch_initialized) {
@@ -32,12 +36,19 @@ int pointer_prefetch_init(void) {
         return 0;
     }
     
+    // Initialize address translator for pointer relocation
+    if (address_translator_init() != 0) {
+        LOG("Failed to initialize address translator\n");
+        pthread_mutex_unlock(&prefetch_mutex);
+        return -1;
+    }
+    
     memset(&prefetch_stats_g, 0, sizeof(prefetch_stats_t));
     prefetch_records_head = NULL;
     prefetch_initialized = true;
     
     pthread_mutex_unlock(&prefetch_mutex);
-    LOG("Pointer prefetch system initialized\n");
+    LOG("Pointer prefetch system initialized with address translation\n");
     return 0;
 }
 
@@ -63,6 +74,9 @@ void pointer_prefetch_cleanup(void) {
     prefetch_records_head = NULL;
     prefetch_initialized = false;
     
+    // Cleanup address translator
+    address_translator_cleanup();
+    
     pthread_mutex_unlock(&prefetch_mutex);
     LOG("Pointer prefetch system cleaned up\n");
 }
@@ -73,16 +87,36 @@ uint64_t read_page_end_pointer(struct user_page *page) {
     }
     
     uint64_t pointer_addr = page->va + PAGE_SIZE - POINTER_OFFSET_FROM_END;
-    uint64_t pointer_value = *(uint64_t*)pointer_addr;
+    uint64_t raw_pointer_value = *(uint64_t*)pointer_addr;
     
-    LOG("Read pointer value 0x%lx from page 0x%lx at offset 0x%lx\n", 
-        pointer_value, page->va, (pointer_addr - page->va));
+    LOG("Read raw pointer value 0x%lx from page 0x%lx at offset 0x%lx\n", 
+        raw_pointer_value, page->va, (pointer_addr - page->va));
     
     pthread_mutex_lock(&prefetch_mutex);
     prefetch_stats_g.pointer_validations++;
     pthread_mutex_unlock(&prefetch_mutex);
     
-    return pointer_value;
+    if (raw_pointer_value == 0) {
+        return 0; 
+    }
+    
+    if (is_valid_remote_pointer(raw_pointer_value)) {
+        pointer_conversion_result_t result = convert_remote_to_local_pointer(raw_pointer_value);
+        if (result.valid) {
+            LOG("Converted remote pointer 0x%lx -> local 0x%lx\n", 
+                raw_pointer_value, result.converted_pointer);
+            return result.converted_pointer;
+        } else {
+            LOG("Failed to convert remote pointer 0x%lx\n", raw_pointer_value);
+            return 0;
+        }
+    } else if (is_valid_local_pointer(raw_pointer_value)) {
+        LOG("Using local pointer 0x%lx as-is\n", raw_pointer_value);
+        return raw_pointer_value;
+    } else {
+        LOG("Invalid pointer value 0x%lx (neither local nor remote)\n", raw_pointer_value);
+        return 0;
+    }
 }
 
 bool validate_pointer(uint64_t pointer_value, uint64_t current_va) {
@@ -115,8 +149,8 @@ bool validate_pointer(uint64_t pointer_value, uint64_t current_va) {
     return true;
 }
 
-// Fetches page content from its current location (existing_page->virtual_offset, assumed RDMA remote)
-// into a new dedicated RDMA prefetch buffer (prefetch_dest_remote_addr).
+// Fetches page content from its current location
+// into a new dedicated RDMA prefetch buffer .
 // Updates record with PREFETCH_IN_PROGRESS and the RDMA write request ID.
 static int transfer_to_prefetch_buffer(struct user_page* existing_page, uint64_t prefetch_dest_remote_addr, prefetch_record_t* record) {
     void* temp_cpu_buffer = libc_malloc(PAGE_SIZE);
@@ -125,7 +159,7 @@ static int transfer_to_prefetch_buffer(struct user_page* existing_page, uint64_t
         return -1;
     }
 
-    // Read from original remote location (current swap location) into CPU buffer
+    // Read from original remote location 
     LOG("Prefetch Transfer: Reading from original remote addr 0x%lx into CPU buffer %p\n", existing_page->virtual_offset, temp_cpu_buffer);
     int read_err = rdma_read_page(-1 /*fd unused*/, existing_page->virtual_offset, temp_cpu_buffer, PAGE_SIZE);
     if (read_err != 0) {
@@ -142,9 +176,9 @@ static int transfer_to_prefetch_buffer(struct user_page* existing_page, uint64_t
                                                 prefetch_dest_remote_addr, 
                                                 PAGE_SIZE, 
                                                 temp_cpu_buffer);
-    libc_free(temp_cpu_buffer); // Data is copied by rdma_submit_request to its internal shm buffer
+    libc_free(temp_cpu_buffer); 
 
-    if (record->rdma_request_id == 0) { // Assuming 0 is an invalid/failed request ID
+    if (record->rdma_request_id == 0) { 
         LOG("Prefetch Transfer: rdma_submit_request (WRITE to prefetch buffer) FAILED\n");
         return -1;
     }
@@ -156,21 +190,27 @@ static int transfer_to_prefetch_buffer(struct user_page* existing_page, uint64_t
 
 int async_prefetch_page(uint64_t target_va, uint64_t source_va) {
     pthread_mutex_lock(&prefetch_mutex);
-    prefetch_stats_g.total_attempts++; // Moved here from handle_page_fault_with_prefetch
+    prefetch_stats_g.total_attempts++; // Count all attempts
 
     struct user_page *existing_page = get_user_page(target_va);
     
     if (existing_page != NULL && !existing_page->swapped_out && existing_page->in_dram) {
         LOG("Target page 0x%lx already in DRAM, skipping prefetch\n", target_va);
         pthread_mutex_unlock(&prefetch_mutex);
-        return 0; // Already present
+        return 0; // Already present, no need to prefetch
+    }
+    
+    if (existing_page != NULL && existing_page->migrating) {
+        LOG("Target page 0x%lx is currently being migrated, skipping prefetch\n", target_va);
+        pthread_mutex_unlock(&prefetch_mutex);
+        return 0; 
     }
 
     prefetch_record_t *record = find_prefetch_record(target_va);
     if (record != NULL && (record->status == PREFETCH_IN_PROGRESS || record->status == PREFETCH_COMPLETED)) {
         LOG("Prefetch for 0x%lx already in progress or completed. Status: %d\n", target_va, record->status);
         pthread_mutex_unlock(&prefetch_mutex);
-        return 0; // Already being handled or done
+        return 0; 
     }
 
     uint64_t prefetch_dest_remote_addr = 0;
@@ -204,39 +244,35 @@ int async_prefetch_page(uint64_t target_va, uint64_t source_va) {
     record->status = PREFETCH_REQUESTED;
 
     if (existing_page != NULL && existing_page->swapped_out) {
-        // Page exists and is on swap (which is RDMA-backed).
-        // Transfer its content from existing_page->virtual_offset to record->remote_addr.
+        // Page exists and is swapped out 
+        LOG("Prefetching swapped out page 0x%lx from virtual_offset 0x%lx\n", target_va, existing_page->virtual_offset);
         if (transfer_to_prefetch_buffer(existing_page, record->remote_addr, record) != 0) {
             LOG("Prefetch for VA 0x%lx failed during transfer_to_prefetch_buffer.\n", target_va);
             record->status = PREFETCH_FAILED;
-            // rdma_sim_free for record->remote_addr will be handled by cleanup if record remains, or explicitly if we remove it
         }
     } else if (existing_page == NULL) {
-        // Page does not exist in ExtMem's metadata (e.g., never touched or from unmanaged mmap).
-        // This prefetcher currently relies on ExtMem metadata to find the source page on swap.
-        // If it's a truly new page not yet in swap, prefetching usually means allocating a zero page.
-        // For now, we can't prefetch it if we don't know its source.
-        LOG("Cannot prefetch VA 0x%lx: page not found in ExtMem metadata (or not swapped out).\n", target_va);
+        // Page not in ExtMem metadata 
+        LOG("Target page 0x%lx not found in ExtMem metadata, cannot prefetch\n", target_va);
         record->status = PREFETCH_FAILED;
-        rdma_sim_free(record->remote_addr); // Free the allocated prefetch buffer as we can't fill it
+        rdma_sim_free(record->remote_addr);
         record->remote_addr = 0;
-    } else { // existing_page != NULL but not swapped_out (e.g. in_dram but error in initial check)
-         LOG("Cannot prefetch VA 0x%lx: page state not suitable (in_dram: %d, swapped_out: %d)\n", target_va, existing_page->in_dram, existing_page->swapped_out);
-         record->status = PREFETCH_FAILED;
-         rdma_sim_free(record->remote_addr);
-         record->remote_addr = 0;
+    } else {
+        // Page exists but not swapped out
+        LOG("Target page 0x%lx exists but not in swappable state (in_dram: %d, swapped_out: %d)\n", 
+            target_va, existing_page->in_dram, existing_page->swapped_out);
+        record->status = PREFETCH_FAILED;
+        rdma_sim_free(record->remote_addr);
+        record->remote_addr = 0;
     }
 
     if (record->status == PREFETCH_IN_PROGRESS) {
         prefetch_stats_g.successful_prefetch++;
         LOG("Successfully initiated prefetch for 0x%lx to remote_addr 0x%lx. RDMA Req ID %lu\n", 
             target_va, record->remote_addr, record->rdma_request_id);
-    } else { // Failed or couldn't start
+    } else { 
         prefetch_stats_g.failed_prefetch++;
-        // Cleanup if record was added but prefetch failed before IN_PROGRESS
         if(record && record->remote_addr == prefetch_dest_remote_addr && prefetch_dest_remote_addr != 0){
-             // We might decide to keep the record as FAILED or remove it.
-             // For now, if it failed to start transfer, free the remote buffer.
+            
         }
         LOG("Prefetch initiation failed or not applicable for VA 0x%lx. Status: %d\n", target_va, record ? record->status : -1);
     }
@@ -245,9 +281,7 @@ int async_prefetch_page(uint64_t target_va, uint64_t source_va) {
     return (record && record->status == PREFETCH_IN_PROGRESS) ? 0 : -1;
 }
 
-// This function is called by handle_page_fault_with_prefetch.
-// It ensures data from record->remote_addr is copied into local_cpu_buffer_for_copy.
-// Then, UFFDIO_COPY is performed by the caller.
+// called by handle_page_fault_with_prefetch.
 static int retrieve_prefetched_data_to_local_buffer(prefetch_record_t *record, void* local_cpu_buffer_for_copy) {
     if (record->status == PREFETCH_IN_PROGRESS) {
         LOG("Retrieving page 0x%lx: Prefetch in progress (req_id %lu), waiting...\n", record->target_va, record->rdma_request_id);
@@ -271,10 +305,10 @@ static int retrieve_prefetched_data_to_local_buffer(prefetch_record_t *record, v
                                                       (uint64_t)local_cpu_buffer_for_copy, 
                                                       record->remote_addr, 
                                                       PAGE_SIZE, 
-                                                      NULL /* data is NULL for read, local_addr is dest */);
+                                                      NULL );
         if (rdma_read_req_id == 0) {
             LOG("Retrieving page 0x%lx: rdma_submit_request (READ from prefetch buffer) FAILED.\n", record->target_va);
-            record->status = PREFETCH_FAILED; // Mark as failed again
+            record->status = PREFETCH_FAILED; 
             return -1;
         }
 
@@ -284,13 +318,10 @@ static int retrieve_prefetched_data_to_local_buffer(prefetch_record_t *record, v
         if (wait_ret == 0 && rdma_error_code == 0) {
             LOG("Retrieving page 0x%lx: Successfully read from prefetch buffer 0x%lx into local_buffer %p.\n", 
                 record->target_va, record->remote_addr, local_cpu_buffer_for_copy);
-            // Data is now in local_cpu_buffer_for_copy. UFFDIO_COPY will be done by caller.
-            // Free the dedicated prefetch remote buffer as it has served its purpose
+            
             rdma_sim_free(record->remote_addr);
-            record->remote_addr = 0; // Mark as freed
-            // Keep status as PREFETCH_COMPLETED to indicate it was used, or change to PREFETCH_NONE/remove.
-            // For simplicity, let's assume it's consumed. The record might be cleaned up later.
-            return 0; // Success
+            record->remote_addr = 0; 
+            return 0; 
         } else {
             LOG("Retrieving page 0x%lx: rdma_wait_request (READ from prefetch buffer) FAILED (wait_ret %d, err %d).\n", 
                 record->target_va, wait_ret, rdma_error_code);
@@ -299,19 +330,16 @@ static int retrieve_prefetched_data_to_local_buffer(prefetch_record_t *record, v
     }
     
     LOG("Retrieving page 0x%lx: Could not retrieve. Status: %d.\n", record->target_va, record->status);
-    return -1; // Failure
+    return -1; 
 }
 
-// Called from core.c. Tries to satisfy the fault for 'page->va' from prefetch cache.
-// If successful, maps the page and returns 0. Otherwise, returns -1.
+// Called from core.c.
 int handle_page_fault_with_prefetch(struct user_page *page) {
     if (!prefetch_initialized || page == NULL) {
         return -1;
     }
 
-    // Ensure per-thread buffer_space (from core.c) is allocated for RDMA read and UFFDIO_COPY src
-    // This should be allocated by core.c's fault handling path before calling this.
-    // We assert it here for safety, though pointer_prefetch.c cannot allocate it itself.
+   
     assert(buffer_space != NULL && "buffer_space (thread-local) must be allocated by caller's path");
 
     pthread_mutex_lock(&prefetch_mutex); // Protects prefetch_records and stats
@@ -321,14 +349,6 @@ int handle_page_fault_with_prefetch(struct user_page *page) {
     if (record != NULL && (record->status == PREFETCH_IN_PROGRESS || record->status == PREFETCH_COMPLETED)) {
         LOG("Page 0x%lx found in prefetch records. Status: %d. Attempting retrieval.\n", page->va, record->status);
         
-        // retrieve_prefetched_data_to_local_buffer will fill buffer_space
-        // It handles mutex internally for record modification if needed during wait.
-        // However, to avoid complex nested locking, this outer lock is simpler for now.
-        // If retrieve_prefetched_data_to_local_buffer needs to take the prefetch_mutex, this will deadlock.
-        // Let's assume retrieve_prefetched_data_to_local_buffer does NOT take prefetch_mutex itself.
-        // Or, release and re-acquire around potentially blocking calls.
-        // For now: keep it simple, retrieve_prefetched_data_to_local_buffer should not block on prefetch_mutex.
-        // It blocks on RDMA ops, not on prefetch_mutex.
 
         int retrieve_ret = retrieve_prefetched_data_to_local_buffer(record, buffer_space);
 
@@ -343,33 +363,27 @@ int handle_page_fault_with_prefetch(struct user_page *page) {
 
             if (ioctl(uffd, UFFDIO_COPY, &copy_op) == -1) {
                 perror("UFFDIO_COPY failed in handle_page_fault_with_prefetch");
-                // If UFFDIO_COPY fails, the page is not mapped. Prefetch attempt failed.
+               
                 record->status = PREFETCH_FAILED; // Mark it as failed.
-                prefetch_stats_g.failed_prefetch++; // Count as overall failure
+                prefetch_stats_g.failed_prefetch++; 
                 pthread_mutex_unlock(&prefetch_mutex);
                 return -1; 
             }
             
-            // Page successfully mapped from prefetch buffer
+        
             page->in_dram = true;
             page->swapped_out = false;
-            // page->migrating should be set to false by the policy/caller after fault is resolved.
-            // For now, to be self-contained for this path:
             page->migrating = false; 
 
             prefetch_stats_g.cache_hits++;
             LOG("Page 0x%lx successfully mapped from prefetch. Cache hit!\n", page->va);
             
-            // Optional: remove the record or mark as consumed
-            // For now, retrieve_prefetched_data_to_local_buffer marks remote_addr = 0
-            // And cleanup_old_prefetch_records can deal with old COMPLETED/FAILED records.
             
             pthread_mutex_unlock(&prefetch_mutex);
-            return 0; // Fault handled by prefetcher
+            return 0; 
         } else {
             LOG("Page 0x%lx: Failed to retrieve from prefetch cache (status %d after attempt).\n", page->va, record->status);
-            // Retrieval failed, record status should be PREFETCH_FAILED.
-            prefetch_stats_g.failed_prefetch++; // Count as overall failure
+            prefetch_stats_g.failed_prefetch++; 
         }
     } else {
         if (record == NULL) {
@@ -380,12 +394,10 @@ int handle_page_fault_with_prefetch(struct user_page *page) {
     }
     
     pthread_mutex_unlock(&prefetch_mutex);
-    return -1; // Fault not handled by prefetcher
+    return -1; 
 }
 
-// Find a prefetch record by target VA
 prefetch_record_t* find_prefetch_record(uint64_t target_va) {
-    // Assumes prefetch_mutex is held by caller if modification is possible
     prefetch_record_t *current = prefetch_records_head;
     while (current != NULL) {
         if (current->target_va == target_va) {
@@ -396,9 +408,8 @@ prefetch_record_t* find_prefetch_record(uint64_t target_va) {
     return NULL;
 }
 
-// Add a new prefetch record or update an existing one
 int add_prefetch_record(uint64_t source_va, uint64_t target_va, uint64_t pointer_value) {
-    // Assumes prefetch_mutex is held by caller
+   
     prefetch_record_t *record = find_prefetch_record(target_va);
     if (record == NULL) {
         record = (prefetch_record_t*)malloc(sizeof(prefetch_record_t));
@@ -415,28 +426,23 @@ int add_prefetch_record(uint64_t source_va, uint64_t target_va, uint64_t pointer
     record->pointer_value = pointer_value;
     record->status = PREFETCH_REQUESTED; // Initial status
     record->timestamp = rdma_get_timestamp(); 
-    record->remote_addr = 0; // Will be set by async_prefetch_page if allocation succeeds
+    record->remote_addr = 0; 
     record->rdma_request_id = 0;
     
     LOG("Added/Updated prefetch record for target_va: 0x%lx, source_va: 0x%lx\n", target_va, source_va);
     return 0;
 }
 
-// Simple check if a page is marked as completed (data in its prefetch buffer)
-// Does not check if the data is *still* in the prefetch buffer (could have been evicted by another prefetch)
-// but retrieve_prefetched_page will re-verify.
+
 bool is_prefetched_page_available(uint64_t va) {
-    // This function is called from handle_page_fault_with_prefetch which already holds the mutex.
-    // No need for separate mutex here.
     prefetch_record_t *record = find_prefetch_record(va);
     if (record != NULL && (record->status == PREFETCH_COMPLETED || record->status == PREFETCH_IN_PROGRESS)) {
-        // If IN_PROGRESS, retrieve will wait. If COMPLETED, retrieve will fetch.
         return true;
     }
     return false;
 }
 
-// Cleanup old or failed prefetch records (simple time-based for now)
+
 void cleanup_old_prefetch_records(void) {
     pthread_mutex_lock(&prefetch_mutex);
     uint64_t current_time = rdma_get_timestamp();
@@ -450,28 +456,25 @@ void cleanup_old_prefetch_records(void) {
         if (current->status == PREFETCH_FAILED) {
             remove_record = true;
         } else if (current->status == PREFETCH_COMPLETED && (current_time - current->timestamp > max_age)) {
-            // Prefetched but not used for a long time
             remove_record = true;
         } else if (current->status == PREFETCH_REQUESTED && (current_time - current->timestamp > max_age)) {
-            // Stuck in requested state for too long
-            current->status = PREFETCH_FAILED; // Mark as failed
+            current->status = PREFETCH_FAILED; 
             remove_record = true;
         } else if (current->status == PREFETCH_IN_PROGRESS && (current_time - current->timestamp > max_age * 2)) {
-            // Stuck in IN_PROGRESS state for too long (e.g. RDMA op lost)
+            
             LOG("Warning: Prefetch record for VA 0x%lx stuck IN_PROGRESS for too long. Marking FAILED.\n", current->target_va);
             current->status = PREFETCH_FAILED;
-            // Should also attempt to cancel/cleanup the RDMA operation if possible, though rdma_sim doesn't support cancel.
             remove_record = true;
         }
 
         if (remove_record) {
-            if (current->remote_addr != 0) { // If a remote buffer was associated with it
+            if (current->remote_addr != 0) { 
                 rdma_sim_free(current->remote_addr);
                 current->remote_addr = 0;
             }
             
             prefetch_record_t *to_free = current;
-            if (prev == NULL) { // Removing head
+            if (prev == NULL) {
                 prefetch_records_head = current->next;
                 current = prefetch_records_head;
             } else {
@@ -479,7 +482,7 @@ void cleanup_old_prefetch_records(void) {
                 current = current->next;
             }
             free(to_free);
-            continue; // current is already advanced
+            continue; 
         }
         prev = current;
         current = current->next;
@@ -502,8 +505,6 @@ void reset_prefetch_stats(void) {
 }
 
 prefetch_stats_t* get_prefetch_stats(void){
-    // Caller should handle thread safety if prefetch_stats_g is read while being updated.
-    // Or, this function could return a copy under mutex.
     return &prefetch_stats_g;
 }
 
@@ -513,4 +514,69 @@ void set_prefetch_distance(uint64_t distance) {
 
 void set_pointer_validation_threshold(uint64_t threshold) {
     pointer_validation_threshold_g = threshold;
+}
+
+int convert_pointers_for_remote_storage(void* page_data, uint64_t page_va) {
+    if (page_data == NULL) {
+        return -1;
+    }
+    
+    uint64_t* pointer_addr = (uint64_t*)((char*)page_data + PAGE_SIZE - POINTER_OFFSET_FROM_END);
+    uint64_t local_pointer = *pointer_addr;
+    
+    LOG("Converting pointer for remote storage: page_va=0x%lx, pointer=0x%lx\n", 
+        page_va, local_pointer);
+    
+    if (local_pointer == 0) {
+        return 0;
+    }
+    
+    if (is_valid_local_pointer(local_pointer)) {
+        pointer_conversion_result_t result = convert_local_to_remote_pointer(local_pointer);
+        if (result.valid) {
+            *pointer_addr = result.converted_pointer;
+            LOG("Converted local pointer 0x%lx -> remote 0x%lx for storage\n", 
+                local_pointer, result.converted_pointer);
+            return 0;
+        } else {
+            LOG("Failed to convert local pointer 0x%lx for remote storage\n", local_pointer);
+            *pointer_addr = 0;
+            return -1;
+        }
+    }
+    LOG("Pointer 0x%lx kept as-is for remote storage\n", local_pointer);
+    return 0;
+}
+
+int convert_pointers_from_remote_storage(void* page_data, uint64_t page_va) {
+    if (page_data == NULL) {
+        return -1;
+    }
+    
+    uint64_t* pointer_addr = (uint64_t*)((char*)page_data + PAGE_SIZE - POINTER_OFFSET_FROM_END);
+    uint64_t remote_pointer = *pointer_addr;
+    
+    LOG("Converting pointer from remote storage: page_va=0x%lx, pointer=0x%lx\n", 
+        page_va, remote_pointer);
+    
+    if (remote_pointer == 0) {
+        return 0;
+    }
+    
+    if (is_valid_remote_pointer(remote_pointer)) {
+        pointer_conversion_result_t result = convert_remote_to_local_pointer(remote_pointer);
+        if (result.valid) {
+            *pointer_addr = result.converted_pointer;
+            LOG("Converted remote pointer 0x%lx -> local 0x%lx from storage\n", 
+                remote_pointer, result.converted_pointer);
+            return 0;
+        } else {
+            LOG("Failed to convert remote pointer 0x%lx from storage\n", remote_pointer);
+            *pointer_addr = 0;
+            return -1;
+        }
+    }
+    
+    LOG("Pointer 0x%lx kept as-is from remote storage\n", remote_pointer);
+    return 0;
 }

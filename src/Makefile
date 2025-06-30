@@ -63,9 +63,9 @@ all: libextmem-rdma.so rdma_process
 # Create include directory if it doesn't exist
 $(shell mkdir -p include)
 
-# RDMA-enabled ExtMem library with pointer prefetch
-libextmem-rdma.so: extmem-rdma.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o observability.o pointer_prefetch.o
-	$(CC) $(LDFLAGS) -o libextmem-rdma.so extmem-rdma.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o pointer_prefetch.o $(LIBS)
+# RDMA-enabled ExtMem library with pointer prefetch and address translation
+libextmem-rdma.so: extmem-rdma.o policies/default.o intercept_layer.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o observability.o pointer_prefetch.o address_translation.o
+	$(CC) $(LDFLAGS) -o libextmem-rdma.so extmem-rdma.o policies/default.o intercept_layer.o observability.o fifo.o storagemanager.o storage_rdma.o rdma_sim.o pointer_prefetch.o address_translation.o $(LIBS)
 
 # RDMA simulation process
 rdma_process.o: rdma_process.c include/rdma_sim.h
@@ -86,8 +86,12 @@ storage_rdma.o: storage_rdma.c include/storage_rdma.h include/rdma_sim.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c storage_rdma.c
 
 # Pointer prefetch implementation
-pointer_prefetch.o: pointer_prefetch.c include/pointer_prefetch.h core.h include/rdma_sim.h include/storage_rdma.h
+pointer_prefetch.o: pointer_prefetch.c include/pointer_prefetch.h core.h include/rdma_sim.h include/storage_rdma.h include/address_translation.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c pointer_prefetch.c
+
+# Address translation implementation
+address_translation.o: address_translation.c include/address_translation.h core.h
+	$(CC) $(CFLAGS) $(INCLUDES) -c address_translation.c
 
 # Shared components
 observability.o: observability.c observability.h core.h
@@ -108,9 +112,21 @@ storagemanager.o: storagemanager.c storagemanager.h core.h
 fifo.o: fifo.c fifo.h core.h
 	$(CC) $(CFLAGS) $(INCLUDES) -c fifo.c
 
-# Test program
+# Test programs
 test_pointer_prefetch: test_pointer_prefetch.c
 	$(CC) -O2 -g test_pointer_prefetch.c -o test_pointer_prefetch
+
+test_pointer_prefetch_extmem: test_pointer_prefetch_extmem.c
+	$(CC) -O2 -g test_pointer_prefetch_extmem.c -ldl -lrt -o test_pointer_prefetch_extmem
+
+test_extmem_direct: test_extmem_direct.c
+	$(CC) -O2 -g test_extmem_direct.c -lrt -o test_extmem_direct
+
+test_pointer_prefetch_final: test_pointer_prefetch_final.c
+	$(CC) -O2 -g test_pointer_prefetch_final.c -ldl -lrt -o test_pointer_prefetch_final
+
+test_pointer_relocation_simple: test_pointer_relocation_simple.c address_translation.o
+	$(CC) -O2 -g -I. -Iinclude test_pointer_relocation_simple.c address_translation.o -lpthread -o test_pointer_relocation_simple
 
 # Install headers to include directory
 # install-headers: include/rdma_sim.h include/storage_rdma.h include/pointer_prefetch.h
@@ -125,7 +141,7 @@ test_pointer_prefetch: test_pointer_prefetch.c
 # 	cp pointer_prefetch.h include/
 
 clean:
-	$(RM) *.o *.so policies/*.o rdma_process test_pointer_prefetch
+	$(RM) *.o *.so policies/*.o rdma_process test_pointer_prefetch test_pointer_prefetch_extmem test_pointer_relocation
 #	$(RM) -rf include/ # Commented out to preserve headers in src/include
 
 .PHONY: default all clean install-headers

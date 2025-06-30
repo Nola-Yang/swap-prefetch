@@ -44,7 +44,7 @@ extern "C" {
 //#define TIEREDMEM
 #define SWAPPER
 
-#define USWAP_IOURING
+// #define USWAP_IOURING //  <<<<<<< MODIFIED: This should be controlled by Makefile
 //#define USWAP_SPDK
 
 #define USWAP_SIGNAL  
@@ -79,8 +79,8 @@ extern uint64_t dramsize;
 
 extern FILE *logfile;
 //#define LOG(...) fprintf(stderr, __VA_ARGS__)
-//#define LOG(...)	fprintf(logfile, __VA_ARGS__)
 #define LOG(str, ...) while(0) {}
+//#define LOG(...) fprintf(stderr, __VA_ARGS__)
 
 //#define LOGPOLICY(...) fprintf(stderr, __VA_ARGS__)
 //#define LOGPOLICY(...)	fprintf(logfile, __VA_ARGS__)
@@ -148,6 +148,7 @@ extern __thread bool internal_malloc;
 extern __thread bool old_internal_call;
 extern __thread bool internal_call;
 extern __thread bool internal_munmap;
+extern __thread void *buffer_space;
 
 
 enum pagetypes {
@@ -220,6 +221,10 @@ void uswap_sig_handler(int code, siginfo_t *siginfo, void *context);
 void uswap_register_handler(int sig);
 
 int core_try_prefault(uint64_t base_boundry);
+int core_try_prefetch(uint64_t base_boundry);
+void core_migrate_up_async_start(struct user_page *page);
+void core_migrate_up_async_finish(struct user_page *page, uint64_t dram_offset);
+void extmem_migrate_downdisk_vector(int nr_evicting, struct user_page **page, struct user_page **diskpage, bool *writeback);
 
 #ifdef __cplusplus
 }

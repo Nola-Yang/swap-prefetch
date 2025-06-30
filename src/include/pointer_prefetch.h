@@ -3,13 +3,13 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "../extmem_test_env/ExtMem/src/core.h" // For struct user_page, PAGE_SIZE
+#include "../core.h" // For struct user_page, PAGE_SIZE
 #include "rdma_sim.h"         // For rdma_get_timestamp
 
 // Default prefetch parameters (can be overridden by setters)
 #define DEFAULT_MAX_PREFETCH_DISTANCE (16 * 1024 * 1024) // 16MB
 #define DEFAULT_PREFETCH_VALIDATION_THRESHOLD (0x100000) // 1MB
-#define DEFAULT_POINTER_OFFSET_FROM_END (sizeof(uint64_t)) // Read the last 8 bytes as a pointer
+#define DEFAULT_POINTER_OFFSET_FROM_END (sizeof(uint64_t)) // Read the last 8 bytes as a pointer (page end)
 
 // Make the constants from .c file available via the header, using the defaults
 #define MAX_PREFETCH_DISTANCE DEFAULT_MAX_PREFETCH_DISTANCE
@@ -64,5 +64,9 @@ void reset_prefetch_stats(void);
 prefetch_stats_t* get_prefetch_stats(void);
 void set_prefetch_distance(uint64_t distance);
 void set_pointer_validation_threshold(uint64_t threshold);
+
+// Pointer relocation functions for remote storage
+int convert_pointers_for_remote_storage(void* page_data, uint64_t page_va);
+int convert_pointers_from_remote_storage(void* page_data, uint64_t page_va);
 
 #endif // POINTER_PREFETCH_H 

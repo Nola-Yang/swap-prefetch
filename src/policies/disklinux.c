@@ -182,6 +182,12 @@ void lrudisk_swapin_external_async(struct user_page *page)
   }while(ret != 0);
   
   
+  // Ensure page state is consistent for async migration
+  if (page->in_dram) {
+    LOG("Warning: Page 0x%lx marked as swapped_out but still in_dram, correcting state\n", page->va);
+    page->in_dram = false;
+  }
+  
   core_migrate_up_async_start(page);
   
   
@@ -849,7 +855,29 @@ int direct_allocate_page_asynch(int nr_pages, int priority)
   return reclaimed;
 }
 
-
+/* Direct allocate page function - synchronous version */
+static struct user_page* direct_allocate_page()
+{
+  struct user_page *page = dequeue_fifo(&dram_free_list);
+  if (page != NULL) {
+    assert(page->in_dram);
+    enqueue_fifo(&inactive_list, page);
+    return page;
+  }
+  
+  // No free pages available, trigger reclaim
+  int reclaimed = direct_allocate_page_asynch(1, 0);
+  if (reclaimed > 0) {
+    page = dequeue_fifo(&dram_free_list);
+    if (page != NULL) {
+      assert(page->in_dram);
+      enqueue_fifo(&inactive_list, page);
+      return page;
+    }
+  }
+  
+  return NULL; // Out of memory
+}
 
 static struct user_page* lrudisk_allocate_page_critical()
 {

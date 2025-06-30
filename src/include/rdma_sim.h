@@ -7,9 +7,6 @@
 #include <pthread.h>   // For mutex, cond
 #include <stdatomic.h> // For atomic types
 
-// Forward declaration of core.h PAGE_SIZE if not directly included
-// For simplicity, assume PAGE_SIZE is accessible. If not, core.h or a config header should be included.
-// #include "../core.h" // Or a more generic path if rdma_sim is independent
 
 #define RDMA_SHM_KEY 0x1234
 #define MAX_RDMA_REQUESTS 128
@@ -43,7 +40,7 @@ typedef struct rdma_request {
     int error_code;
     bool data_in_shm_buffer; // True if data for WRITE is in rdma_shm.page_buffer
     size_t buffer_offset;     // Added for offset within shm page_buffer or other region
-    uint64_t timestamp;       // Added: Timestamp of request submission or last update
+    uint64_t timestamp;       // Timestamp of request submission or last update
     // For small data, a direct buffer could be here, but current rdma_sim.c uses page_buffer for writes
     // uint8_t embedded_data[SOME_SIZE]; 
     // size_t embedded_data_len;
@@ -62,8 +59,7 @@ typedef struct rdma_shm {
     atomic_bool initialized;
     atomic_bool shutdown_requested;
 
-    // Shared page buffer for data transfers (e.g., client writes data here, server reads for RDMA write)
-    // (Or server writes data here from RDMA read, client reads)
+    // Shared page buffer for data transfers 
     unsigned char page_buffer[RDMA_PAGE_BUFFER_SIZE]; 
 
     // Remote memory simulation metadata

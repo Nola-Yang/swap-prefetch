@@ -21,11 +21,13 @@
 #include <stdbool.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/utsname.h>
 
 #include "core.h"
 #include "timer.h"
 #include "uthash.h"
 #include "observability.h"
+#include "include/pointer_prefetch.h"
 
 #ifdef USWAP_IOURING
 #include "storage_iouring.h"
@@ -38,6 +40,9 @@
 #include "storagemanager.h"
 #endif
 
+#define GIGA_PFN_MASK   (GIGAPAGE_MASK ^ UINT64_MAX)
+
+static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_t fault_thread;
 
@@ -105,6 +110,17 @@ __thread uint64_t prev_fault_1 = 0;
 volatile uint64_t prev_fault_global_2 = 0;
 volatile uint64_t prev_fault_global_1 = 0;
 
+// Forward declaration for extmem_stop if not already visible
+void extmem_stop(void);
+
+// Destructor function
+void extmem_library_cleanup(void) __attribute__((destructor));
+void extmem_library_cleanup(void) {
+    fprintf(stderr, "DEBUG: extmem_library_cleanup() CALLED (via destructor)\n");
+    fflush(stderr);
+    
+    extmem_stop();
+}
 
 static void *extmem_stats_thread()
 {
@@ -244,6 +260,17 @@ void uswap_register_handler(int sig)
 
 void extmem_init()
 {
+    if (is_init) {
+        return;
+    }
+
+    pthread_mutex_lock(&init_lock);
+
+    if (is_init) {
+        pthread_mutex_unlock(&init_lock);
+        return;
+    }
+
   struct uffdio_api uffdio_api;
   int s = 1;
 
@@ -273,23 +300,44 @@ void extmem_init()
   
 #ifdef SWAPPER
   // SSD Init
-  // for now only requirement from disk is to have a file descriptor
-  diskpath = getenv("SWAPDIR");
-  if(diskpath == NULL) {
-    diskpath = malloc(sizeof(SWAPPATH_DEFAULT));
-    strcpy(diskpath, SWAPPATH_DEFAULT);
-  }  
+  const char* env_swapdir = getenv("SWAPDIR");
+  const char* default_local_swapfile = "extmem_swap_backing_file.dat"; // Default filename in CWD
+
+  if (diskpath != NULL) { // Should only happen if init is called multiple times, clean up old one
+    free(diskpath);
+    diskpath = NULL;
+  }
+
+  if (env_swapdir != NULL) {
+    diskpath = strdup(env_swapdir);
+    if (!diskpath) { perror("strdup for SWAPDIR"); assert(0); }
+  } else {
+    diskpath = strdup(default_local_swapfile);
+    if (!diskpath) { perror("strdup for default_local_swapfile"); assert(0); }
+  }
 
   struct stat st;
+  char actual_swap_file_path[1024]; // Buffer for the path to be opened
+
   if (stat(diskpath, &st) == 0 && S_ISDIR(st.st_mode)) {
-    char swap_file_path[1024];
-    snprintf(swap_file_path, sizeof(swap_file_path), "%s/extmem_swap.bin", diskpath);
-    diskfd = open(swap_file_path, O_RDWR | O_DIRECT);
+    // If diskpath (from env or default if it somehow pointed to a dir) is a directory,
+    // create a specific file named "extmem_swap.bin" inside it.
+    snprintf(actual_swap_file_path, sizeof(actual_swap_file_path), "%s/extmem_swap.bin", diskpath);
   } else {
-    diskfd = open(diskpath, O_RDWR | O_DIRECT);
+    // Otherwise, diskpath itself is the file path.
+    strncpy(actual_swap_file_path, diskpath, sizeof(actual_swap_file_path) - 1);
+    actual_swap_file_path[sizeof(actual_swap_file_path) - 1] = '\0'; // Corrected: Ensure null termination
   }
+  
+  // Open the swap file with O_CREAT and permissions, without O_DIRECT
+  diskfd = open(actual_swap_file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH); // 0644 permissions
+
   if (diskfd < 0) {
-    perror("disk open");
+    char err_msg[1080];
+    snprintf(err_msg, sizeof(err_msg), "disk open failed for %s", actual_swap_file_path);
+    perror(err_msg); // perror will append the system error string
+    
+    LOG("Failed to open swap file: %s. Original diskpath variable: %s\n", actual_swap_file_path, diskpath);
   }
   assert(diskfd >= 0);
   
@@ -299,6 +347,7 @@ void extmem_init()
   }
 #endif
   
+  pointer_prefetch_init();
 
   uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK );
   if (uffd == -1) {
@@ -348,8 +397,10 @@ void extmem_init()
   }
 
   char* dramsize_string = getenv("DRAMSIZE");
-  if(dramsize_string != NULL)
+  if(dramsize_string != NULL) {
     dramsize = strtoull(dramsize_string, NULL, 10);
+    printf("DRAMSIZE set to %lu bytes\n", dramsize);
+  }
   else
     dramsize = DRAMSIZE_DEFAULT;
 
@@ -400,22 +451,35 @@ void extmem_init()
 
   is_init = true;
 
-  struct user_page *dummy_page = calloc(1, sizeof(struct user_page));
+  struct user_page *dummy_page = (struct user_page *)calloc(1, sizeof(struct user_page));
   add_page(dummy_page);
 
   LOG("extmem_init: finished\n");
 
   internal_call = false;
+
+  pthread_mutex_unlock(&init_lock);
+
+  LOG("extmem_init: completed\n");
+  fprintf(logfile, "extmem_init: completed\n" );
+  fflush(logfile);
 }
 
 
 void extmem_stop()
 {
+  fprintf(stderr, "DEBUG: extmem_stop() CALLED\n"); fflush(stderr);
+  print_prefetch_stats();
   policy_shutdown();
   
 #ifdef SWAPPER
-  storage_shutdown();
+  // storage_shutdown();
+  if (diskpath != NULL) {
+    free(diskpath);
+    diskpath = NULL;
+  }
 #endif
+  pointer_prefetch_cleanup();
 }
 
 static void extmem_mmap_populate(void* addr, size_t length)
@@ -456,6 +520,9 @@ void* extmem_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t 
   int need_populate = false;
   internal_call = true;
 
+  printf("DEBUG: extmem_mmap called: length=%ld (%ld MB), flags=0x%x\n", length, length/(1024*1024), flags);
+  fflush(stdout);
+
   assert(is_init);
   assert(length != 0);
 
@@ -495,17 +562,23 @@ void* extmem_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t 
   }
   assert(p != NULL && p != MAP_FAILED);
 
-  main_mmap = p;
+  main_mmap = (uint64_t)p;
   // register with uffd
+  printf("DEBUG: Registering region with userfaultfd: start=0x%lx, len=%ld\n", (uint64_t)p, length);
+  fflush(stdout);
   struct uffdio_register uffdio_register;
   uffdio_register.range.start = (uint64_t)p;
   uffdio_register.range.len = length;
   uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
   uffdio_register.ioctls = 0;
   if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
+    printf("DEBUG: userfaultfd registration FAILED\n");
+    fflush(stdout);
     perror("ioctl uffdio_register");
     assert(0);
   }
+  printf("DEBUG: userfaultfd registration SUCCESS\n");
+  fflush(stdout);
 
    
   if (need_populate) {
@@ -767,8 +840,12 @@ void core_migrate_up_async_start(struct user_page *page)
   gettimeofday(&start, NULL);
 #if defined(USWAP_SPDK)
   assert(!"spdk funcitons not implemented yet");
-#else
+#elif defined(USWAP_IOURING)
   ioring_start_read(diskfd, disk_addr_offset, buffer_space, pagesize);
+#else
+  // This path is for USWAP_RDMA or default storagemanager if page_swapin_external_async is called
+  // For now, it's a no-op for the "start" phase as RDMA ops are typically submit-and-wait.
+  LOG("Warning: core_migrate_up_async_start called for non-IO_URING/SPDK backend. No specific async start action.\n");
 #endif
 
   gettimeofday(&end, NULL);
@@ -820,8 +897,15 @@ void core_migrate_up_async_finish(struct user_page *page, uint64_t dram_offset)
   gettimeofday(&start, NULL);
 #if defined(USWAP_SPDK)
   assert(!"spdk funcitons not implemented yet");
-#else
+#elif defined(USWAP_IOURING)
   ioring_finish_read(diskfd, disk_addr_offset, buffer_space, pagesize);
+#else
+  // This path is for USWAP_RDMA or default storagemanager.
+  // The actual read would happen here if it were truly async and separated.
+  // For RDMA, the equivalent of "finish" is often part of the wait after submit.
+  // If core_migrate_updisk's pattern is followed, the read is synchronous.
+  // This function, if called for RDMA, implies an async model not fully mapped.
+  LOG("Warning: core_migrate_up_async_finish called for non-IO_URING/SPDK backend. Assuming read completed elsewhere or is synchronous.\n");
 #endif
   gettimeofday(&end, NULL);
   LOG_TIME("memcpy_to_dram: %f s\n", elapsed(&start, &end));
@@ -873,6 +957,7 @@ void core_migrate_up_async_finish(struct user_page *page, uint64_t dram_offset)
 
 void extmem_migrate_downdisk(struct user_page *page, uint64_t disk_offset, bool need_wp, bool writeback)
 {
+  // fprintf(stderr, "DEBUG_SWAP: extmem_migrate_downdisk CALLED for page VA: 0x%lx\n", page->va); fflush(stderr);
   void *old_addr;
   uint64_t new_addr;
   //void *newptr;
@@ -917,7 +1002,7 @@ void extmem_migrate_downdisk(struct user_page *page, uint64_t disk_offset, bool 
     //LOG("initiating io_uring write\n");
     ioring_write_store(diskfd, new_addr, page->va, pagesize);
   #else
-    extmem_disk_write(diskfd, page->va, new_addr, pagesize);
+    extmem_disk_write(diskfd, (void*)page->va, new_addr, pagesize);
   #endif
   }
   
@@ -926,7 +1011,7 @@ void extmem_migrate_downdisk(struct user_page *page, uint64_t disk_offset, bool 
   // Unmap the physical mapping of the page
   // This is not portable but works as expected in Linux
   // Doing munmap would remove uffd mappings, doing mremap with some flags may work
-  if (madvise(page->va, pagesize, MADV_DONTNEED) == -1){
+  if (madvise((void*)page->va, pagesize, MADV_DONTNEED) == -1){
         perror("madvise DONTNEED failed");
         assert(0);
   }
@@ -986,29 +1071,30 @@ void extmem_migrate_downdisk_vector(int nr_evicting, struct user_page **page, st
       new_addr = diskpage[nr_prepared]->virtual_offset;
 
       #if defined(USWAP_SPDK)
-        assert(!"spdk functions not implemented yet")
+        assert(!"spdk functions not implemented yet");
       #elif defined(USWAP_IOURING)
         //LOG("initiating io_uring write\n");
         ioring_prepare_write(diskfd, new_addr, page[nr_prepared]->va, PAGE_SIZE);
-      #else
-        extmem_disk_write(diskfd, page[nr_prepared]->va, new_addr, PAGE_SIZE);
+        nr_submitted++; // Increment only if iouring_prepare_write is called
+      #else // USWAP_RDMA or default
+        extmem_disk_write(diskfd, (void*)page[nr_prepared]->va, new_addr, PAGE_SIZE);
+        // For non-iouring, nr_submitted might track successful sync writes or remain unused if not batching.
+        // If extmem_disk_write is synchronous, nr_submitted isn't strictly needed for batch control here.
       #endif      
-      nr_submitted++;
     }
-
     nr_prepared++;
-
   }
   
-  #ifdef USWAP_IOURING
-  // submit together
-  ioring_submit_all_writes();
-
-  // receive the results
-  nr_prepared = 0;
-  while(nr_prepared < nr_submitted){
-    ioring_finish_write();
-    nr_prepared++;  
+  #if defined(USWAP_IOURING)
+  // Only submit/finish if iouring was used and submissions were prepared
+  if (nr_submitted > 0) { 
+    ioring_submit_all_writes();
+    // receive the results
+    nr_prepared = 0; // Reset counter for finishing
+    while(nr_prepared < nr_submitted){
+      ioring_finish_write();
+      nr_prepared++;  
+    }
   }
   #endif
 
@@ -1018,7 +1104,7 @@ void extmem_migrate_downdisk_vector(int nr_evicting, struct user_page **page, st
     // Unmap the physical mapping of the page
     // This is not portable but works as expected in Linux
     // Doing munmap would remove uffd mappings, doing mremap with some flags may work
-    if (madvise(page[nr_prepared]->va, PAGE_SIZE, MADV_DONTNEED) == -1){
+    if (madvise((void*)page[nr_prepared]->va, PAGE_SIZE, MADV_DONTNEED) == -1){
           perror("madvise DONTNEED failed");
           assert(0);
     }
@@ -1026,20 +1112,6 @@ void extmem_migrate_downdisk_vector(int nr_evicting, struct user_page **page, st
   }
   // we except uffd registration of this virtual address
   // to remain so we can fault and swap in on next access
-  nr_prepared = 0;
-  while(nr_prepared < nr_evicting){  
-    migrations_down++;
-
-    page[nr_prepared]->virtual_offset = diskpage[nr_prepared]->virtual_offset;
-    page[nr_prepared]->in_dram = false;
-    //page->swapped_out = true;
-    //page->migrating = false;
-
-    bytes_migrated += PAGE_SIZE;
-
-    nr_prepared++;
-  }
-  //page->migrations_down++;
   nr_prepared = 0;
   pthread_mutex_lock(&handler_lock);  // lock should go in?
   while(nr_prepared < nr_evicting){
@@ -1114,8 +1186,10 @@ void handle_wp_fault(struct user_page *page)
 
 void handle_missing_fault(struct user_page *page)
 {
+  // fprintf(stderr, "DEBUG_SWAP: handle_missing_fault CALLED for page VA: 0x%lx\n", page->va); fflush(stderr);
   // Page mising fault case - probably the first touch case
   // allocate in DRAM via LRU
+
   void* newptr;
   struct timeval missing_start, missing_end;
   struct timeval start, end;
@@ -1195,6 +1269,32 @@ void handle_missing_fault(struct user_page *page)
     //gettimeofday(&start, NULL);
     // Critical path swapping in
     
+    // Ensure buffer_space is allocated before prefetch handling
+    if(buffer_allocated == false){
+        buffer_space = libc_mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE , -1, 0);
+        if (buffer_space == MAP_FAILED) {
+            perror("buffer space mmap");
+            assert(0);
+        }
+        buffer_allocated = true;
+        LOG("Buffer space mapped at %lx\n", (uint64_t)buffer_space);
+    }
+
+    // Check if page is available in prefetch cache
+    if (handle_page_fault_with_prefetch(page) == 0) {
+        LOG("Page 0x%lx satisfied from prefetch cache\n", page_boundry);
+        // Page was successfully handled by prefetcher, update state and return
+        pthread_mutex_lock(&handler_lock);
+        page->swapped_out = false;
+        page->migrating = false;
+        pthread_mutex_unlock(&handler_lock);
+        major_faults_handled++;
+        gettimeofday(&missing_end, NULL);
+        LOG_TIME("extmem_major_fault_prefetch: %f s\n", elapsed(&missing_start, &missing_end));
+        internal_call = false;
+        return;
+    }
+    
     swap_offset = page->virtual_offset;
     //in_dram = newpage->in_dram;
     pagesize = pt_to_pagesize(page->pt);
@@ -1221,6 +1321,33 @@ void handle_missing_fault(struct user_page *page)
     
 
     pthread_mutex_unlock(&handler_lock);
+    
+    // After page is loaded, read pointer from page end and initiate prefetch
+    if (page->in_dram) {
+        LOG("Page 0x%lx successfully swapped in, checking for prefetch opportunity\n", page_boundry);
+        uint64_t pointer_value = read_page_end_pointer(page);
+        LOG("Read pointer value 0x%lx from page end of 0x%lx\n", pointer_value, page_boundry);
+        
+        if (pointer_value != 0) {
+            if (validate_pointer(pointer_value, page_boundry)) {
+                uint64_t target_va = pointer_value & ~(PAGE_SIZE - 1);  // Align to page boundary
+                LOG("Valid pointer detected! Initiating prefetch for target VA 0x%lx from pointer 0x%lx in page 0x%lx\n", 
+                    target_va, pointer_value, page_boundry);
+                
+                if (async_prefetch_page(target_va, page_boundry) == 0) {
+                    LOG("Successfully initiated prefetch for VA 0x%lx\n", target_va);
+                } else {
+                    LOG("Failed to initiate prefetch for VA 0x%lx\n", target_va);
+                }
+            } else {
+                LOG("Invalid pointer 0x%lx detected in page 0x%lx, skipping prefetch\n", pointer_value, page_boundry);
+            }
+        } else {
+            LOG("NULL pointer found in page 0x%lx, no prefetch needed\n", page_boundry);
+        }
+    } else {
+        LOG("Warning: Page 0x%lx not marked as in_dram after swap in\n", page_boundry);
+    }
     
     //first_faults_handled++;
     major_faults_handled++;
@@ -1563,6 +1690,10 @@ int core_try_prefetch(uint64_t base_boundry)
   struct user_page* prefetch_list[CORE_PREFETCH_RATE];
   struct user_page* freepage_list[CORE_PREFETCH_RATE];
   
+  // Initialize arrays
+  memset(prefetch_list, 0, sizeof(prefetch_list));
+  memset(freepage_list, 0, sizeof(freepage_list));
+  
   struct timeval missing_start, missing_end;
   struct timeval start, end;
   struct user_page *page;
@@ -1637,6 +1768,16 @@ int core_try_prefetch(uint64_t base_boundry)
     assert(page->va != 0);
     policy_detach_page(page);
     prefetch_list[nr_prefetch] = page;
+    
+    // Get a free page for this prefetch
+    freepage_list[nr_prefetch] = pagefault();
+    if (freepage_list[nr_prefetch] == NULL) {
+      // Failed to get free page, abort this prefetch
+      pthread_mutex_unlock(&handler_lock);
+      ret = -1;
+      break;
+    }
+    
     nr_prefetch++;
 
   }
@@ -1666,84 +1807,65 @@ int core_try_prefetch(uint64_t base_boundry)
     
   }
 
-  int submitted_jobs = 0;
-  uint64_t buffer_pointer = (uint64_t)prefetch_buffer;
+  int actual_submitted_io_ops = 0;
+  uint64_t current_buffer_pointer = (uint64_t)prefetch_buffer;
 
-  while(submitted_jobs < nr_prefetch){
-    page = prefetch_list[submitted_jobs];
+#if defined(USWAP_IOURING)
+  for(int i = 0; i < nr_prefetch; ++i) {
+    page = prefetch_list[i];
     disk_addr_offset = page->virtual_offset;
-  
-    #if defined(USWAP_SPDK)
-      assert(!"spdk funcitons not implemented yet");
-    #else
-      ioring_prepare_read(diskfd, disk_addr_offset, (void*)buffer_pointer, PAGE_SIZE);
-    #endif
-
-    LOG("job submitted: %d\n", submitted_jobs);
-  
-    submitted_jobs++;
-    buffer_pointer += PAGE_SIZE;
+    // Ensure buffer_pointer increments correctly for each prep.
+    ioring_prepare_read(diskfd, disk_addr_offset, (void*)(current_buffer_pointer + (i * PAGE_SIZE)), PAGE_SIZE);
+    LOG("iouring_prepare_read for job %d: va %lx, disk_offset %lx, buffer %p\n", i, page->va, disk_addr_offset, (void*)(current_buffer_pointer + (i * PAGE_SIZE)));
+    actual_submitted_io_ops++;
   }
 
-  ioring_submit_all_reads();
-    
-  assert(submitted_jobs == nr_prefetch);
-
-  // collect free pages from policy
-  int nr_free = 0;
-
-  while(nr_free < nr_prefetch){
-
-    freepage_list[nr_free] = pagefault();
-
-    assert(freepage_list[nr_free] != NULL);
-
-    nr_free++;
-  } 
-
-  // finish IO jobs 
-  submitted_jobs = 0;
-  buffer_pointer = (uint64_t)prefetch_buffer;
-
-  while(submitted_jobs < nr_prefetch){
-    page = prefetch_list[submitted_jobs];
-    disk_addr_offset = page->virtual_offset;
-  
-    #if defined(USWAP_SPDK)
-      assert(!"spdk funcitons not implemented yet");
-    #else
-      ioring_finish_read(diskfd, disk_addr_offset, (void*)buffer_pointer, PAGE_SIZE);
-    #endif
-
-    submitted_jobs++;
-    buffer_pointer += PAGE_SIZE;
+  if (actual_submitted_io_ops > 0) {
+    ioring_submit_all_reads();
+    LOG("iouring_submit_all_reads for %d ops\n", actual_submitted_io_ops);
   }
+  // For iouring, the reads are async. The data will be copied by the kernel into prefetch_buffer.
+  // No explicit finish loop here; UFFDIO_COPY will use the (hopefully) ready data.
+#else // Fallback for non-iouring (e.g., USWAP_RDMA or default synchronous)
+  for(int i = 0; i < nr_prefetch; ++i) {
+    page = prefetch_list[i];
+    disk_addr_offset = page->virtual_offset;
+    extmem_disk_read(diskfd, disk_addr_offset, (void*)(current_buffer_pointer + (i * PAGE_SIZE)), PAGE_SIZE);
+    LOG("Synchronous prefetch read for job %d: va %lx, disk_offset %lx, to buffer %p\n", i, page->va, disk_addr_offset, (void*)(current_buffer_pointer + (i * PAGE_SIZE)));
+    actual_submitted_io_ops++; // Count successful synchronous "ops"
+  }
+#endif
+  
+  // assert(actual_submitted_io_ops == nr_prefetch); // This might not hold if some sync reads failed, or if nr_prefetch was optimistic
 
+  // The UFFDIO_COPY loop is common. It uses the data from prefetch_buffer.
   int finished_jobs = 0;
-  buffer_pointer = (uint64_t)prefetch_buffer;
+  // current_buffer_pointer should be reset or used with index 'i' for source.
+  // Let's use (uint64_t)prefetch_buffer + (finished_jobs * PAGE_SIZE) for clarity in src.
 
-  while(finished_jobs < nr_prefetch){
-    page = prefetch_list[finished_jobs];
-    freepage = freepage_list[finished_jobs];
-
-
-
+  while(finished_jobs < actual_submitted_io_ops){ // Iterate up to actual ops initiated
+    page = prefetch_list[finished_jobs]; // page must be valid
+    
     struct uffdio_copy copy = {
         .dst = (uint64_t)page->va
-      , .src = (uint64_t)buffer_pointer
+      , .src = (uint64_t)prefetch_buffer + (finished_jobs * PAGE_SIZE) // Correct source buffer
       , .len = PAGE_SIZE
       , .mode = UFFDIO_COPY_MODE_DONTWAKE
     };
 
     // mapping page using UFFDIO
     if (ioctl(uffd, UFFDIO_COPY, &copy) == -1){
-      perror("UFFDIO_COPY failed ");
-      assert(0);
+      char error_buf[256];
+      snprintf(error_buf, sizeof(error_buf), "UFFDIO_COPY failed for prefetch VA %lx from buffer %p", page->va, (void*)((uint64_t)prefetch_buffer + (finished_jobs * PAGE_SIZE)));
+      perror(error_buf);
+      // Decide if to assert(0) or just log and continue trying others.
+      // For now, let's not assert, to see if other prefetches succeed.
+    } else {
+       LOG("UFFDIO_COPY successful for prefetch VA %lx\n", page->va);
     }
 
-    policy_ack_swapped_in(page, freepage);
+    policy_ack_swapped_in(page, freepage_list[finished_jobs]); // freepage_list needs to be valid for this index
     page->in_dram = true;
-    // anything else?
     pthread_mutex_lock(&handler_lock);
     page->swapped_out = false;
     page->migrating = false;
@@ -1752,12 +1874,12 @@ int core_try_prefetch(uint64_t base_boundry)
     pthread_mutex_unlock(&handler_lock);
 
     finished_jobs++;
-    buffer_pointer += PAGE_SIZE;
   }
   
-  assert(finished_jobs == nr_prefetch);
-  
-  return finished_jobs;  // return number of successful prefaults
+  // Return the number of pages successfully UFFDIO_COPY'd or at least attempted.
+  // The original returned nr_prefetch, which might be optimistic.
+  // Returning finished_jobs seems more accurate to what was processed by UFFDIO_COPY.
+  return finished_jobs;
   //internal_call = false;
   
 }

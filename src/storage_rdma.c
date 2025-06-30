@@ -17,27 +17,29 @@
 #include "core.h"
 #include "include/rdma_sim.h"
 #include "include/storage_rdma.h"
+#include "include/pointer_prefetch.h"
+#include "include/address_translation.h"
 
 static pid_t rdma_process_pid = -1;
 static bool rdma_initialized = false;
 static pthread_mutex_t rdma_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// 远程内存分配表
+
 #define MAX_REMOTE_REGIONS 65536
 typedef struct {
-    uint64_t virtual_offset;      // 虚拟偏移（用作key）
-    uint64_t remote_addr;         // 远程内存地址
-    size_t size;                  // 分配大小
-    bool in_use;                  // 是否在使用
-    uint64_t last_access;         // 最后访问时间
-    bool dirty;                   // 是否已修改
+    uint64_t virtual_offset;      
+    uint64_t remote_addr;         
+    size_t size;                  
+    bool in_use;                 
+    uint64_t last_access;         
+    bool dirty;                   
 } remote_region_t;
 
 static remote_region_t remote_regions[MAX_REMOTE_REGIONS];
 static int num_remote_regions = 0;
 static pthread_mutex_t remote_regions_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// 统计信息
+
 static uint64_t rdma_reads = 0;
 static uint64_t rdma_writes = 0;
 static uint64_t rdma_hits = 0;
@@ -45,7 +47,7 @@ static uint64_t rdma_misses = 0;
 static uint64_t rdma_allocations = 0;
 static uint64_t rdma_frees = 0;
 
-// 查找RDMA进程可执行文件
+
 static char* find_rdma_process() {
     const char* paths[] = {
         "./rdma_process",
@@ -54,7 +56,6 @@ static char* find_rdma_process() {
         NULL
     };
     
-    // 首先检查环境变量
     const char* env_path = getenv("EXTMEM_RDMA_PROCESS_PATH");
     if (env_path != NULL) {
         if (access(env_path, X_OK) == 0) {
@@ -63,7 +64,6 @@ static char* find_rdma_process() {
         fprintf(stderr, "RDMA process not found at EXTMEM_RDMA_PROCESS_PATH: %s\n", env_path);
     }
     
-    // 尝试预定义路径
     for (int i = 0; paths[i] != NULL; i++) {
         if (access(paths[i], X_OK) == 0) {
             return strdup(paths[i]);
@@ -73,7 +73,6 @@ static char* find_rdma_process() {
     return NULL;
 }
 
-// 启动RDMA进程
 static int start_rdma_process() {
     char* rdma_path = find_rdma_process();
     if (rdma_path == NULL) {
@@ -81,7 +80,7 @@ static int start_rdma_process() {
         return -1;
     }
     
-    char *argv[] = {rdma_path, "-v", NULL};  // 默认启用详细输出
+    char *argv[] = {rdma_path, "-v", NULL};  
     char *envp[] = {NULL};
     int ret;
     
@@ -95,7 +94,6 @@ static int start_rdma_process() {
     
     LOG("RDMA process started with PID: %d\n", rdma_process_pid);
     
-    // 等待进程初始化
     for (int i = 0; i < 10; i++) {
         usleep(100000);  // 100ms
         
@@ -106,7 +104,6 @@ static int start_rdma_process() {
             }
         }
         
-        // 尝试连接到共享内存
         if (rdma_sim_init(false) == 0) {
             return 0;
         }
@@ -117,7 +114,6 @@ static int start_rdma_process() {
     return -1;
 }
 
-// 查找远程区域
 static remote_region_t* find_remote_region(uint64_t virtual_offset) {
     for (int i = 0; i < num_remote_regions; i++) {
         if (remote_regions[i].in_use && remote_regions[i].virtual_offset == virtual_offset) {
@@ -127,11 +123,9 @@ static remote_region_t* find_remote_region(uint64_t virtual_offset) {
     return NULL;
 }
 
-// 分配新的远程区域
 static remote_region_t* allocate_remote_region(uint64_t key_virtual_offset, size_t size) {
     int free_index = -1;
     
-    // 找到空闲槽位
     for (int i = 0; i < MAX_REMOTE_REGIONS; i++) {
         if (!remote_regions[i].in_use) {
             free_index = i;
@@ -140,7 +134,6 @@ static remote_region_t* allocate_remote_region(uint64_t key_virtual_offset, size
     }
     
     if (free_index == -1) {
-        // 没有空闲槽位，使用LRU驱逐
         uint64_t oldest_time = UINT64_MAX;
         int oldest_index = -1;
         
@@ -155,20 +148,35 @@ static remote_region_t* allocate_remote_region(uint64_t key_virtual_offset, size
             return NULL;
         }
         
-        // 释放最旧的区域
         rdma_sim_free(remote_regions[oldest_index].remote_addr);
         free_index = oldest_index;
         rdma_frees++;
     }
     
-    // 在远程节点分配内存
-    uint64_t remote_addr;
-    int ret = rdma_sim_allocate(size, &remote_addr);
+    uint64_t req_id = rdma_submit_request(RDMA_OP_ALLOCATE, 0, 0, size, NULL);
+    if (req_id == 0) {
+        return NULL;
+    }
+
+    int error_code;
+    int ret = rdma_wait_request(req_id, &error_code);
     if (ret != 0) {
         return NULL;
     }
+
+    uint64_t remote_addr = 0;
+    for (uint32_t i = 0; i < MAX_RDMA_REQUESTS; i++) {
+        rdma_shm_t* shm = get_rdma_shm();
+        if (shm && shm->requests[i].request_id == req_id) {
+            remote_addr = shm->requests[i].remote_addr;
+            break;
+        }
+    }
     
-    // 更新区域条目
+    if (remote_addr == 0) {
+        return NULL;
+    }
+    
     remote_regions[free_index].virtual_offset = key_virtual_offset;
     remote_regions[free_index].remote_addr = remote_addr;
     remote_regions[free_index].size = size;
@@ -184,7 +192,6 @@ static remote_region_t* allocate_remote_region(uint64_t key_virtual_offset, size
     return &remote_regions[free_index];
 }
 
-// 初始化RDMA存储
 int rdma_storage_init() {
     pthread_mutex_lock(&rdma_mutex);
     
@@ -195,18 +202,29 @@ int rdma_storage_init() {
     
     printf("Initializing pure RDMA storage (no disk backend)...\n");
     
-    // 初始化远程区域跟踪
     memset(remote_regions, 0, sizeof(remote_regions));
     num_remote_regions = 0;
     
-    // 启动RDMA进程
-    int ret = start_rdma_process();
-    if (ret != 0) {
-        pthread_mutex_unlock(&rdma_mutex);
-        return -1;
+    int ret = -1;
+    fprintf(stderr, "RDMA_STORAGE_INIT: Attempting to connect to existing RDMA server (rdma_sim_init(false))...\n");
+    if (rdma_sim_init(false) == 0) { 
+        fprintf(stderr, "RDMA_STORAGE_INIT: Successfully connected to existing RDMA server via rdma_sim_init(false).\n");
+        ret = 0; 
+    } else {
+        fprintf(stderr, "RDMA_STORAGE_INIT: Failed to connect to existing RDMA server. Attempting to start new server via start_rdma_process()...\n");
+        ret = start_rdma_process(); 
+        if (ret == 0) {
+            fprintf(stderr, "RDMA_STORAGE_INIT: Successfully started and connected to new RDMA server via start_rdma_process().\n");
+        } else {
+            fprintf(stderr, "RDMA_STORAGE_INIT: Failed to start and connect to new RDMA server via start_rdma_process(). Error code from start_rdma_process: %d\n", ret);
+        }
     }
     
-    // 发送初始化请求
+    if (ret != 0) {
+        pthread_mutex_unlock(&rdma_mutex);
+        return -1; // Failed to connect or start & connect
+    }
+    
     uint64_t req_id = rdma_submit_request(RDMA_OP_INIT, 0, 0, 0, NULL);
     if (req_id < 0) {
         fprintf(stderr, "Failed to submit RDMA initialization request\n");
@@ -216,7 +234,6 @@ int rdma_storage_init() {
         return -1;
     }
     
-    // 等待初始化完成
     int error_code;
     for (int i = 0; i < 5; i++) {
         ret = rdma_wait_request(req_id, &error_code);
@@ -236,7 +253,6 @@ int rdma_storage_init() {
     
     rdma_initialized = true;
     
-    // 重置统计
     rdma_reads = rdma_writes = rdma_hits = rdma_misses = 0;
     rdma_allocations = rdma_frees = 0;
     
@@ -245,7 +261,6 @@ int rdma_storage_init() {
     return 0;
 }
 
-// 关闭RDMA存储
 void rdma_storage_shutdown() {
     pthread_mutex_lock(&rdma_mutex);
     
@@ -256,17 +271,14 @@ void rdma_storage_shutdown() {
     
     printf("Shutting down pure RDMA storage...\n");
     
-    // 发送关闭请求
     uint64_t req_id = rdma_submit_request(RDMA_OP_SHUTDOWN, 0, 0, 0, NULL);
     if (req_id >= 0) {
         int error_code;
         rdma_wait_request(req_id, &error_code);
     }
     
-    // 清理共享内存
     rdma_sim_cleanup(false);
     
-    // 等待RDMA进程退出
     int status;
     for (int i = 0; i < 10; i++) {
         if (waitpid(rdma_process_pid, &status, WNOHANG) == rdma_process_pid) {
@@ -275,7 +287,6 @@ void rdma_storage_shutdown() {
         usleep(100000);
     }
     
-    // 强制终止
     if (kill(rdma_process_pid, 0) == 0) {
         kill(rdma_process_pid, SIGTERM);
         usleep(100000);
@@ -286,7 +297,6 @@ void rdma_storage_shutdown() {
     
     rdma_initialized = false;
     
-    // 打印最终统计
     printf("\n=== Pure RDMA Storage Statistics ===\n");
     printf("Reads: %lu\n", rdma_reads);
     printf("Writes: %lu\n", rdma_writes); 
@@ -301,7 +311,6 @@ void rdma_storage_shutdown() {
     pthread_mutex_unlock(&rdma_mutex);
 }
 
-// 分配远程页面偏移
 uint64_t rdma_allocate_page_offset(size_t size) {
     if (!rdma_initialized) {
         return UINT64_MAX;
@@ -321,9 +330,10 @@ uint64_t rdma_allocate_page_offset(size_t size) {
     return offset;
 }
 
-// 读取页面（纯RDMA）
 int rdma_read_page(int fd, uint64_t virtual_offset, void* dest, size_t size) {
+    fprintf(stderr, "DEBUG_SWAP: rdma_read_page CALLED for virtual_offset: 0x%lx\n", virtual_offset); fflush(stderr);
     if (!rdma_initialized) {
+
         fprintf(stderr, "RDMA storage not initialized\n");
         return -1;
     }
@@ -336,27 +346,22 @@ int rdma_read_page(int fd, uint64_t virtual_offset, void* dest, size_t size) {
     if (region == NULL) {
         LOG("RDMA Read Error: virtual_offset 0x%lx not found in remote_regions.\n", virtual_offset);
         rdma_misses++;
-        // This is a critical error. Reading a page that was never written/allocated a remote slot.
-        // Forcing an error here, as returning 0 would imply success with garbage data.
         pthread_mutex_unlock(&remote_regions_mutex);
         return -EFAULT; // Or another suitable error code
     }
     
-    // 页面在远程内存中
     region->last_access = time(NULL);
     uint64_t remote_addr = region->remote_addr;
     pthread_mutex_unlock(&remote_regions_mutex);
     
     rdma_hits++;
     
-    // 执行RDMA读取
     uint64_t req_id = rdma_submit_request(RDMA_OP_READ, (uint64_t)dest, remote_addr, size, NULL);
     if (req_id < 0) {
         fprintf(stderr, "Failed to submit RDMA read request\n");
         return -1;
     }
     
-    // 等待读取完成
     int error_code;
     int ret = rdma_wait_request(req_id, &error_code);
     if (ret != 0) {
@@ -364,19 +369,24 @@ int rdma_read_page(int fd, uint64_t virtual_offset, void* dest, size_t size) {
         return -1;
     }
     
-    // 从RDMA缓冲区复制数据
     rdma_shm_t* shm = get_rdma_shm();
     if (shm) {
-        // 找到请求的buffer_offset（简化实现，假设单一请求）
         memcpy(dest, shm->page_buffer, size);
     }
     
-    LOG("RDMA read completed: offset=%lu, size=%zu\n", virtual_offset, size);
+    if (size == PAGE_SIZE) {
+        int conv_ret = convert_pointers_from_remote_storage(dest, virtual_offset);
+        if (conv_ret != 0) {
+            LOG("Warning: Pointer conversion failed for virtual_offset 0x%lx during read\n", virtual_offset);
+        }
+    }
+    
+    LOG("RDMA read completed with pointer conversion: offset=%lu, size=%zu\n", virtual_offset, size);
     return 0;
 }
 
-// 写入页面（纯RDMA）
 int rdma_write_page(int fd, uint64_t virtual_offset, void* src, size_t size) {
+    fprintf(stderr, "DEBUG_SWAP: rdma_write_page CALLED for virtual_offset: 0x%lx\n", virtual_offset); fflush(stderr);
     if (!rdma_initialized) {
         fprintf(stderr, "RDMA storage not initialized\n");
         return -1;
@@ -395,14 +405,12 @@ int rdma_write_page(int fd, uint64_t virtual_offset, void* src, size_t size) {
             LOG("RDMA Write Error: Failed to allocate remote_region for virtual_offset 0x%lx.\n", virtual_offset);
             return -ENOMEM; 
         }
-        rdma_misses++; // A write to a new virtual_offset is a 'miss' in terms of finding an existing mapping.
+        rdma_misses++; 
     } else {
         rdma_hits++;
     }
     
-    // Ensure the allocated region size matches the write size. 
-    // This simple model doesn't support overwriting part of a larger region or extending.
-    // If region->size != size, it might indicate an issue or require more complex region management.
+    
     if (region->size != size) {
         LOG("RDMA Write Warning: virtual_offset 0x%lx region size %zu an PPage size %zu for remote_addr 0x%lx. Re-allocating.\n",
             virtual_offset, region->size, size, region->remote_addr);
@@ -422,27 +430,47 @@ int rdma_write_page(int fd, uint64_t virtual_offset, void* src, size_t size) {
     region->last_access = time(NULL);
     region->dirty = true; 
     pthread_mutex_unlock(&remote_regions_mutex);
+
+    void* converted_page_data = malloc(size);
+    if (converted_page_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for pointer conversion\n");
+        return -ENOMEM;
+    }
+
+    memcpy(converted_page_data, src, size);
     
-    // 执行RDMA写入
-    uint64_t req_id = rdma_submit_request(RDMA_OP_WRITE, (uint64_t)src, region->remote_addr, size, src);
-    if (req_id < 0) {
-        fprintf(stderr, "Failed to submit RDMA write request\n");
+    
+    if (size == PAGE_SIZE) {
+        // Register address region for this page if not already done
+        register_address_region(virtual_offset, size, region->remote_addr);
+        
+        int conv_ret = convert_pointers_for_remote_storage(converted_page_data, virtual_offset);
+        if (conv_ret != 0) {
+            LOG("Warning: Pointer conversion failed for virtual_offset 0x%lx\n", virtual_offset);
+        }
+    }
+    
+    uint64_t req_id = rdma_submit_request(RDMA_OP_WRITE, (uint64_t)converted_page_data, region->remote_addr, size, converted_page_data);
+    if (req_id == 0) {
+        free(converted_page_data);
+        fprintf(stderr, "DEBUG: Failed to submit RDMA write request (req_id=0) for offset %lu\n", virtual_offset);
         return -1;
     }
     
-    // 等待写入完成
     int error_code;
     int ret = rdma_wait_request(req_id, &error_code);
+    
+    free(converted_page_data);
+    
     if (ret != 0) {
-        fprintf(stderr, "RDMA write failed with error code: %d\n", error_code);
+        fprintf(stderr, "RDMA write failed for offset %lu with error code: %d (ret=%d)\n", virtual_offset, error_code, ret);
         return -1;
     }
     
-    LOG("RDMA write completed: offset=%lu, size=%zu\n", virtual_offset, size);
+    LOG("RDMA write completed with pointer conversion: offset=%lu, size=%zu\n", virtual_offset, size);
     return 0;
 }
 
-// 获取统计信息
 void rdma_get_storage_stats(uint64_t *reads, uint64_t *writes, uint64_t *hits, uint64_t *misses) {
     if (reads) *reads = rdma_reads;
     if (writes) *writes = rdma_writes;
@@ -450,7 +478,6 @@ void rdma_get_storage_stats(uint64_t *reads, uint64_t *writes, uint64_t *hits, u
     if (misses) *misses = rdma_misses;
 }
 
-// 打印详细统计
 void rdma_print_detailed_stats() {
     pthread_mutex_lock(&remote_regions_mutex);
     
@@ -465,7 +492,6 @@ void rdma_print_detailed_stats() {
     printf("  Frees: %lu\n", rdma_frees);
     printf("  Active regions: %d / %d\n", num_remote_regions, MAX_REMOTE_REGIONS);
     
-    // 显示活跃区域信息
     printf("Active regions:\n");
     int shown = 0;
     for (int i = 0; i < num_remote_regions && shown < 10; i++) {

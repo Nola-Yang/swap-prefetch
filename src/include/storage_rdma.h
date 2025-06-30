@@ -4,9 +4,6 @@
 #include <stdint.h>
 #include <stddef.h> // For size_t
 
-// Potentially include other headers if their types are used in function signatures,
-// e.g., rdma_sim.h if rdma_op_type_e or other rdma_sim specific types were needed here.
-// For now, only basic types are used in the signatures below.
 
 /**
  * @brief Initializes the RDMA storage system.
