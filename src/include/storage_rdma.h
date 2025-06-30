@@ -1,69 +1,67 @@
-/**
- * @file storage_rdma.h
- * @brief RDMA-based storage manager for ExtMem
- * 
- * This provides an RDMA-based storage implementation for ExtMem,
- * where pages can be swapped to remote memory instead of disk.
- */
 #ifndef STORAGE_RDMA_H
 #define STORAGE_RDMA_H
 
 #include <stdint.h>
-#include <stddef.h>
+#include <stddef.h> // For size_t
+
+// Potentially include other headers if their types are used in function signatures,
+// e.g., rdma_sim.h if rdma_op_type_e or other rdma_sim specific types were needed here.
+// For now, only basic types are used in the signatures below.
 
 /**
- * Initialize RDMA storage.
- * 
- * This function starts the RDMA simulation process and establishes
- * shared memory communication for RDMA operations.
- * 
- * @return 0 on success, -1 on failure
+ * @brief Initializes the RDMA storage system.
+ * This typically involves starting the rdma_process and initializing communication.
+ * @return 0 on success, non-zero on failure.
  */
 int rdma_storage_init(void);
 
 /**
- * Shutdown RDMA storage.
- * 
- * This function stops the RDMA simulation process and cleans up resources.
+ * @brief Shuts down the RDMA storage system.
+ * This involves stopping the rdma_process and cleaning up resources.
  */
 void rdma_storage_shutdown(void);
 
 /**
- * Read a page from RDMA storage.
- * 
- * This function reads a page from RDMA storage, either from remote memory
- * if it's cached there, or from disk if it's not cached.
- * 
- * @param fd File descriptor for disk (used as fallback)
- * @param disk_offset Offset in the disk file
- * @param dest Destination buffer
- * @param size Size of the page
- * @return 0 on success, -1 on failure
+ * @brief Allocates a new page/block in the RDMA-backed storage and returns its virtual offset.
+ * The virtual offset is used as a key for subsequent read/write operations.
+ * @param size The size of the page/block to allocate (e.g., PAGE_SIZE).
+ * @return A unique virtual offset (uint64_t) on success, or a special value (e.g., 0 or -1 cast to uint64_t) on failure.
  */
-int rdma_read_page(int fd, uint64_t disk_offset, void* dest, size_t size);
+uint64_t rdma_allocate_page_offset(size_t size);
 
 /**
- * Write a page to RDMA storage.
- * 
- * This function writes a page to both disk (for durability) and
- * to remote memory if it's cached there.
- * 
- * @param fd File descriptor for disk
- * @param disk_offset Offset in the disk file
- * @param src Source buffer
- * @param size Size of the page
- * @return 0 on success, -1 on failure
+ * @brief Reads a page from the RDMA storage into a local buffer.
+ * @param fd File descriptor (likely unused in a pure RDMA context, but kept for API consistency if adapted from disk I/O).
+ * @param virtual_offset The virtual offset of the page to read (obtained from rdma_allocate_page_offset).
+ * @param dest Pointer to the local buffer where the page data will be copied.
+ * @param size The size of the page to read (e.g., PAGE_SIZE).
+ * @return 0 on success, non-zero on failure.
  */
-int rdma_write_page(int fd, uint64_t disk_offset, void* src, size_t size);
+int rdma_read_page(int fd, uint64_t virtual_offset, void* dest, size_t size);
 
 /**
- * Get RDMA storage statistics.
- * 
- * @param reads Pointer to variable to store number of read operations
- * @param writes Pointer to variable to store number of write operations
- * @param hits Pointer to variable to store number of cache hits
- * @param misses Pointer to variable to store number of cache misses
+ * @brief Writes a page from a local buffer to the RDMA storage.
+ * @param fd File descriptor (likely unused).
+ * @param virtual_offset The virtual offset of the page to write to (obtained from rdma_allocate_page_offset).
+ * @param src Pointer to the local buffer containing the page data to be written.
+ * @param size The size of the page to write (e.g., PAGE_SIZE).
+ * @return 0 on success, non-zero on failure.
+ */
+int rdma_write_page(int fd, uint64_t virtual_offset, void* src, size_t size);
+
+/**
+ * @brief Retrieves RDMA storage statistics.
+ * @param reads Pointer to store the total number of RDMA read operations.
+ * @param writes Pointer to store the total number of RDMA write operations.
+ * @param hits Pointer to store the total number of cache hits (if applicable to the storage layer).
+ * @param misses Pointer to store the total number of cache misses (if applicable).
  */
 void rdma_get_storage_stats(uint64_t *reads, uint64_t *writes, uint64_t *hits, uint64_t *misses);
 
-#endif /* STORAGE_RDMA_H */
+/**
+ * @brief Prints detailed RDMA storage statistics to the console/log.
+ */
+void rdma_print_detailed_stats(void);
+
+
+#endif // STORAGE_RDMA_H 

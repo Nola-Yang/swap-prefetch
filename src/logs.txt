@@ -1,1 +1,0 @@
-extmem_init: started
